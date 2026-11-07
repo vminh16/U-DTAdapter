@@ -3,7 +3,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from udt.return_cap import ExpectileLoss, GlobalReturnCap, compute_global_expectile
+from udt.return_cap import (
+    ExpectileLoss,
+    GlobalReturnCap,
+    ReturnCapMLP,
+    ReturnCapper,
+    compute_global_expectile,
+)
+from udt.intervention import ReturnBudget
 
 
 def test_expectile_loss_symmetric_tau_half():
@@ -62,3 +69,80 @@ def test_global_return_cap():
     dummy_state = np.zeros(10)
     assert cap.get_cap(dummy_state, step=0) == 90.0
     assert cap.get_cap(dummy_state, step=500) == 90.0
+
+
+def test_return_cap_mlp_forward_shapes():
+    state_dim = 17
+    batch_size = 32
+
+    # Mode: state_time (Baseline B3)
+    mlp_st = ReturnCapMLP(state_dim=state_dim, hidden_dim=128, num_layers=3, mode="state_time")
+    states = torch.randn(batch_size, state_dim)
+    t_rel = torch.rand(batch_size, 1)
+    out_st = mlp_st(states, t_rel)
+    assert out_st.shape == (batch_size, 1)
+
+    # 1D single-step input
+    out_st_single = mlp_st(states[0], t_rel[0])
+    assert out_st_single.shape == (1, 1)
+
+    # Mode: time_only (Baseline B9)
+    mlp_to = ReturnCapMLP(state_dim=state_dim, hidden_dim=64, num_layers=2, mode="time_only")
+    out_to = mlp_to(None, t_rel)
+    assert out_to.shape == (batch_size, 1)
+
+    # Mode: state_only (Ablation)
+    mlp_so = ReturnCapMLP(state_dim=state_dim, hidden_dim=64, num_layers=2, mode="state_only")
+    out_so = mlp_so(states, None)
+    assert out_so.shape == (batch_size, 1)
+
+
+def test_return_cap_mlp_parameter_count():
+    # Strict parameter budget from RRD: < 300k parameters for auxiliary networks
+    mlp = ReturnCapMLP(state_dim=24, hidden_dim=128, num_layers=3, mode="state_time")
+    num_params = sum(p.numel() for p in mlp.parameters())
+    assert num_params < 300_000
+    assert num_params > 1_000
+
+
+def test_return_capper_clips_budget_without_mutating_raw():
+    global_cap = GlobalReturnCap(cap_value=1.0)
+    capper = ReturnCapper(model=global_cap, horizon=1000, margin=0.0)
+    budget = ReturnBudget(raw=1.5, reward_scale=1000.0)
+    dummy_state = np.zeros(10)
+
+    token = capper.step(budget, dummy_state, step=10)
+    # Token is clipped to cap
+    assert np.isclose(token, 1.0)
+    # Raw budget must NOT be mutated by clipping (critical mathematical requirement)
+    assert np.isclose(budget.raw, 1.5)
+
+    # Verify that observe_reward operates on raw budget
+    budget.observe_reward(reward=200.0)  # raw becomes 1.5 - 0.2 = 1.3
+    assert np.isclose(budget.raw, 1.3)
+
+
+
+def test_return_capper_respects_safety_margin():
+    global_cap = GlobalReturnCap(cap_value=1.0)
+    capper = ReturnCapper(model=global_cap, horizon=1000, margin=0.2)
+    budget = ReturnBudget(raw=1.5)
+    dummy_state = np.zeros(10)
+
+    token = capper.step(budget, dummy_state, step=10)
+    # Token = min(1.5, 1.0 + 0.2) = 1.2
+    assert np.isclose(token, 1.2)
+
+
+def test_return_capper_handles_horizon_boundary():
+    mlp = ReturnCapMLP(state_dim=4, hidden_dim=32, num_layers=2, mode="state_time")
+    capper = ReturnCapper(model=mlp, horizon=100, margin=0.0)
+    budget = ReturnBudget(raw=1.0)
+    state = np.zeros(4)
+
+    # Step at or beyond horizon should not crash or produce NaNs
+    token_at_h = capper.step(budget, state, step=100)
+    token_beyond_h = capper.step(budget, state, step=150)
+    assert not np.isnan(token_at_h)
+    assert not np.isnan(token_beyond_h)
+
