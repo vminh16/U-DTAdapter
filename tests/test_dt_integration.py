@@ -10,6 +10,7 @@ from udt.dt_integration import (
     RealDTUnavailable,
     assert_parameters_frozen,
     load_decision_transformer,
+    train_decision_transformer,
     verify_b0_parity,
     verify_n1_matches_dt_action,
 )
@@ -201,3 +202,145 @@ def test_r_only_and_u_only_branches_use_expected_components():
     )
     assert b4.rollout.clipping_frequency == 0.0
     assert b4.rollout.caps == [float("inf"), float("inf")]
+
+
+def test_train_decision_transformer_uses_baseline_sequence_trainer(tmp_path):
+    import json
+
+    # Create synthetic trajectory dataset
+    # 4 trajectories (eids 0, 1, 2 are train, 3 is validation)
+    obs = []
+    acts = []
+    rews = []
+    rtgs = []
+    timesteps = []
+    terminals = []
+    eids = []
+    is_val = []
+
+    for eid in range(4):
+        val_flag = (eid == 3)
+        for t in range(5):
+            obs.append([float(eid + 1), float(t)])
+            acts.append([float(eid * 0.1 + t * 0.01)])
+            rews.append(1.0)
+            rtgs.append(5.0 - t)
+            timesteps.append(t)
+            terminals.append(t == 4)
+            eids.append(eid)
+            is_val.append(val_flag)
+
+    dataset_path = tmp_path / "dataset.npz"
+    np.savez(
+        dataset_path,
+        observations=np.array(obs, dtype=np.float32),
+        actions=np.array(acts, dtype=np.float32),
+        rewards=np.array(rews, dtype=np.float32),
+        returns_to_go=np.array(rtgs, dtype=np.float32),
+        timesteps=np.array(timesteps, dtype=np.int64),
+        terminals=np.array(terminals, dtype=bool),
+        episode_ids=np.array(eids, dtype=np.int64),
+        is_validation=np.array(is_val, dtype=bool),
+    )
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "state_mean": [1.0, 2.0],
+        "state_std": [1.0, 1.0],
+        "reward_scale": 1000.0,
+        "horizon": 10,
+    }))
+
+    output_ckpt = tmp_path / "model.pt"
+
+    model, summary = train_decision_transformer(
+        dataset_path,
+        manifest_path,
+        output_path=output_ckpt,
+        num_steps=5,
+        batch_size=2,
+        k=3,
+        embed_dim=16,
+        n_layer=1,
+        n_head=1,
+        eval_interval=5,
+        eval_batches=2,
+        device="cpu",
+        seed=42,
+    )
+
+    assert output_ckpt.exists()
+    assert summary["num_train_trajectories"] == 3
+    assert summary["num_val_trajectories"] == 1
+    assert len(summary["metrics"]["train_loss"]) == 5
+    assert "val_loss" in summary["metrics"]
+
+    # Load back the saved checkpoint and verify parameter freezing & parity
+    loaded_model, payload = load_decision_transformer(
+        output_ckpt,
+        state_dim=2,
+        act_dim=1,
+        hidden_size=16,
+        max_length=3,
+        max_ep_len=10,
+        n_layer=1,
+        n_head=1,
+    )
+    assert_parameters_frozen(loaded_model)
+
+    adapter = DTAdapter(
+        loaded_model,
+        state_dim=2,
+        act_dim=1,
+        max_length=3,
+        state_mean=np.array([1.0, 2.0], dtype=np.float32),
+        state_std=np.array([1.0, 1.0], dtype=np.float32),
+    )
+    report = verify_b0_parity(
+        loaded_model,
+        adapter,
+        observations=[np.array([1.0, 2.0], dtype=np.float32)],
+        rtg_tokens=[5.0],
+        model_source="real",
+    )
+    assert report["passed"] is True
+
+
+def test_train_decision_transformer_in_memory_and_no_output_path():
+    # Pass in-memory dicts with no validation split
+    arrays = {
+        "observations": np.ones((10, 2), dtype=np.float32),
+        "actions": np.zeros((10, 1), dtype=np.float32),
+        "rewards": np.ones(10, dtype=np.float32),
+        "returns_to_go": np.ones(10, dtype=np.float32),
+        "timesteps": np.arange(10, dtype=np.int64),
+        "episode_ids": np.zeros(10, dtype=np.int64),
+    }
+    manifest = {
+        "state_mean": [0.0, 0.0],
+        "state_std": [1.0, 1.0],
+        "horizon": 10,
+        "reward_scale": 100.0,
+    }
+
+    model, summary = train_decision_transformer(
+        arrays,
+        manifest,
+        output_path=None,
+        num_steps=3,
+        batch_size=2,
+        k=2,
+        embed_dim=16,
+        n_layer=1,
+        n_head=1,
+        eval_interval=None,
+        device="cpu",
+    )
+
+    assert isinstance(model, nn.Module)
+    assert len(summary["metrics"]["train_loss"]) == 3
+    assert summary["num_train_trajectories"] == 1
+    assert summary["num_val_trajectories"] == 0
+    assert_parameters_frozen(model)
+
+

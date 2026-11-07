@@ -53,6 +53,8 @@ def evaluate_with_budget(
     rng: np.random.Generator | int | None = None,
     seed: int | None = None,
     policy_reset_fn: Callable[[], None] | None = None,
+    policy_set_rng_fn: Callable[[np.random.Generator], None] | None = None,
+    requires_proposal_rng: bool | None = None,
     strict_env_seed: bool = False,
 ) -> RolloutResult:
     """Execute a single closed-loop evaluation rollout with Return Budgeting.
@@ -137,11 +139,36 @@ def evaluate_with_budget(
     # Candidate proposals are owned by the policy/controller; give it its own
     # stream when the policy supports explicit injection.
     policy_owner = getattr(policy_fn, "__self__", None)
-    for candidate in (policy_fn, policy_owner):
-        setter = getattr(candidate, "set_rng", None) if candidate is not None else None
-        if callable(setter):
-            setter(proposal_rng)
-            break
+    setter = policy_set_rng_fn
+    if setter is None:
+        for candidate in (policy_fn, policy_owner):
+            possible = getattr(candidate, "set_rng", None) if candidate is not None else None
+            if callable(possible):
+                setter = possible
+                break
+
+    proposal_injected = False
+    if callable(setter):
+        setter(proposal_rng)
+        proposal_injected = True
+
+    policy_requires_proposals = requires_proposal_rng
+    if policy_requires_proposals is None:
+        for candidate in (policy_fn, policy_owner):
+            req = getattr(candidate, "requires_proposal_rng", None)
+            if req is not None:
+                policy_requires_proposals = bool(req)
+                break
+        if policy_requires_proposals is None:
+            policy_requires_proposals = False
+
+    if policy_requires_proposals and not proposal_injected:
+        raise RuntimeError(
+            "Candidate-proposal RNG injection failed: policy requires proposal RNG "
+            "for deterministic candidate proposals, but no set_rng interface was available."
+        )
+
+    seed_mapping["streams"]["candidate_proposal"]["injected"] = proposal_injected
 
     if capper is not None:
         if not np.isclose(capper.scale, reward_scale):

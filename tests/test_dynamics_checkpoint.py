@@ -60,8 +60,6 @@ def trained_ensemble():
         epochs=2,
         batch_size=8,
         seed=3,
-        state_mean=np.array([5.0, -3.0], dtype=np.float32),
-        state_std=np.array([2.0, 4.0], dtype=np.float32),
     )
     return ensemble, metrics
 

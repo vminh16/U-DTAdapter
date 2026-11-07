@@ -42,7 +42,12 @@ def _as_int_list(values: Iterable[Any] | None) -> list[int]:
     return [int(value) for value in values]
 
 
-def _load_payload(path: str | Path) -> dict[str, Any]:
+def _load_payload(
+    path: str | Path,
+    *,
+    weights_only: bool = True,
+    allow_unsafe_legacy: bool = False,
+) -> dict[str, Any]:
     path = Path(path)
     if path.suffix.lower() == ".json":
         payload = json.loads(path.read_text())
@@ -52,7 +57,25 @@ def _load_payload(path: str | Path) -> dict[str, Any]:
 
     import torch
 
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not weights_only and not allow_unsafe_legacy:
+        raise ValueError(
+            "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
+            "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
+        )
+
+    if allow_unsafe_legacy:
+        import warnings
+        warnings.warn(
+            "Loading checkpoint with unsafe deserialization (weights_only=False). "
+            "Only do this for trusted legacy files.",
+            UserWarning,
+            stacklevel=2,
+        )
+        actual_weights_only = False
+    else:
+        actual_weights_only = True
+
+    payload = torch.load(path, map_location="cpu", weights_only=actual_weights_only)
     if not isinstance(payload, dict):
         raise ValueError(f"{path} does not contain a dictionary payload")
     return payload
@@ -138,13 +161,16 @@ def _has_dynamics_component(
 def _torch_load_if_needed(
     payload: Mapping[str, Any] | None,
     checkpoint: str | Path | None,
+    *,
+    weights_only: bool = True,
+    allow_unsafe_legacy: bool = False,
 ) -> dict[str, Any] | None:
     if payload is not None:
         return dict(payload)
     if checkpoint is None:
         return None
     try:
-        return _load_payload(checkpoint)
+        return _load_payload(checkpoint, weights_only=weights_only, allow_unsafe_legacy=allow_unsafe_legacy)
     except Exception as exc:  # report as evidence instead of crashing readiness
         return {"_load_error": f"{type(exc).__name__}: {exc}", "_path": str(checkpoint)}
 
@@ -332,6 +358,39 @@ def _check_bootstrap(
             problems.append(f"head {index}: sampled non-training episodes {invalid[:5]}")
         if int(info.get("bootstrap_transitions", 0)) <= 0:
             problems.append(f"head {index}: no bootstrap transitions")
+
+    valid_seeds = [s for s in seeds if s is not None]
+    if len(models) > 1 and len(set(valid_seeds)) != len(valid_seeds):
+        problems.append(
+            f"bootstrap seeds are not distinct across heads (duplicate seeds detected: {seeds})"
+        )
+
+    payload_bootstrap = (dynamics_payload or {}).get("bootstrap")
+    if payload_bootstrap is not None:
+        if not isinstance(payload_bootstrap, list) or len(payload_bootstrap) != len(models):
+            problems.append(
+                f"top-level bootstrap records count ({len(payload_bootstrap) if isinstance(payload_bootstrap, list) else 0}) "
+                f"!= models count ({len(models)})"
+            )
+        else:
+            for idx, item in enumerate(payload_bootstrap):
+                if isinstance(item, dict) and "bootstrap_seed" in item:
+                    payload_s = item["bootstrap_seed"]
+                    metric_s = seeds[idx]
+                    if payload_s is not None and metric_s is not None and payload_s != metric_s:
+                        problems.append(
+                            f"head {idx}: top-level bootstrap metadata seed ({payload_s}) "
+                            f"inconsistent with metric record ({metric_s})"
+                        )
+
+    init_seeds = (dynamics_payload or {}).get("init_seeds")
+    if init_seeds is not None:
+        if not isinstance(init_seeds, list) or len(init_seeds) != len(models):
+            problems.append(
+                f"top-level init_seeds count ({len(init_seeds) if isinstance(init_seeds, list) else 0}) "
+                f"!= models count ({len(models)})"
+            )
+
     if ensemble is not None and getattr(ensemble, "num_models", len(models)) != len(models):
         problems.append(
             f"ensemble has {ensemble.num_models} heads but metrics record {len(models)}"
@@ -374,6 +433,22 @@ def _check_normalization(
             "fail",
             "Dynamics normalization coordinate_system must be 'raw_observation'.",
             coordinate_system=coordinate_system,
+        )
+
+    norm_dict: Mapping[str, Any] = {}
+    if dynamics_payload is not None and isinstance(dynamics_payload.get("normalization"), Mapping):
+        norm_dict = dynamics_payload["normalization"]
+    elif ensemble is not None and isinstance(getattr(ensemble, "normalization_provenance", None), Mapping):
+        norm_dict = ensemble.normalization_provenance
+
+    norm_source = norm_dict.get("source", "external_unverified")
+    norm_verified = norm_dict.get("verified", False)
+    if norm_source == "external_unverified" or not norm_verified:
+        return _check(
+            "blocked",
+            "Dynamics normalization statistics are unverified or lack evidence of train-only computation.",
+            source=norm_source,
+            verified=norm_verified,
         )
 
     r_mean, r_std = _return_stats(return_model, return_payload)
@@ -618,14 +693,20 @@ def check_pilot_readiness(
     capper: Any | None = None,
     dt_parity: Mapping[str, Any] | None = None,
     required_variants: Sequence[str] = SUPPORTED_VARIANTS,
+    weights_only: bool = True,
+    allow_unsafe_legacy: bool = False,
 ) -> dict[str, Any]:
     """Audit a pilot artifact set and return a pass/fail/blocked report.
 
     The function never raises for missing evidence; callers must inspect
     ``ready`` and the per-check statuses before claiming a run is reportable.
     """
-    dynamics_payload = _torch_load_if_needed(dynamics_payload, dynamics_checkpoint)
-    return_payload = _torch_load_if_needed(return_payload, return_checkpoint)
+    dynamics_payload = _torch_load_if_needed(
+        dynamics_payload, dynamics_checkpoint, weights_only=weights_only, allow_unsafe_legacy=allow_unsafe_legacy
+    )
+    return_payload = _torch_load_if_needed(
+        return_payload, return_checkpoint, weights_only=weights_only, allow_unsafe_legacy=allow_unsafe_legacy
+    )
 
     checks = {
         "provenance": _check_provenance(manifest, dynamics_payload, dataset_path),

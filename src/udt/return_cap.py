@@ -424,11 +424,11 @@ def evaluate_return_capper(
     for start in range(0, n, batch_size):
         stop = min(n, start + batch_size)
         preds = capper.get_cap_batch(obs[start:stop], timesteps[start:stop])
-        target = returns[start:stop] - margin
-        diff = target - preds
+        batch_y = returns[start:stop]
+        diff = batch_y - preds
         weights = np.where(diff < 0.0, 1.0 - tau, tau)
-        loss_sum += float(np.sum(weights * diff ** 2))
-        covered += int(np.sum(diff <= 0.0))
+        loss_sum += float(np.sum(weights * (diff ** 2)))
+        covered += int(np.sum(batch_y <= preds + margin))
     return {
         "samples": int(n),
         "loss": loss_sum / n,

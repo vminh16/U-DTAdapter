@@ -54,6 +54,8 @@ def _make_artifacts(tmp_path):
             "state_mean": [0.0, 0.0],
             "state_std": [1.0, 1.0],
             "coordinate_system": "raw_observation",
+            "source": "dynamics_training_split",
+            "verified": True,
         },
         "horizon": 10,
         "reward_scale": 1000.0,

@@ -98,6 +98,7 @@ class DynamicsEnsemble:
         state_std: np.ndarray | None = None,
         horizon: int | None = None,
         reward_scale: float | None = None,
+        normalization_provenance: dict[str, Any] | None = None,
     ):
         if num_models < 1:
             raise ValueError(f"num_models must be >= 1, got {num_models}")
@@ -112,6 +113,15 @@ class DynamicsEnsemble:
             raise ValueError("state_mean and state_std must be provided together")
         if self.state_std is not None and np.any(self.state_std <= 0):
             raise ValueError("state_std must be strictly positive")
+        if normalization_provenance is not None:
+            self.normalization_provenance = dict(normalization_provenance)
+        elif self.state_mean is not None:
+            self.normalization_provenance = {
+                "source": "external_unverified",
+                "verified": False,
+            }
+        else:
+            self.normalization_provenance = {}
         self.horizon = None if horizon is None else int(horizon)
         if self.horizon is not None and self.horizon <= 0:
             raise ValueError(f"horizon must be positive, got {horizon}")
@@ -356,6 +366,7 @@ def train_dynamics_ensemble(
     device: str = "cpu",
     patience: int = 5,
     seed: int | None = None,
+    normalization_provenance: dict[str, Any] | None = None,
 ) -> tuple[DynamicsEnsemble, dict[str, Any]]:
     """Train M independent dynamics transition models on offline dataset.
 
@@ -422,6 +433,13 @@ def train_dynamics_ensemble(
         )
     if actions.ndim != 2 or actions.shape[1] == 0 or len(actions) != n_samples:
         raise ValueError(f"actions must have shape ({n_samples}, act_dim), got {actions.shape}")
+    if rewards.shape != (n_samples,):
+        raise ValueError(f"rewards must have shape ({n_samples},), got {rewards.shape}")
+    if terminals_arr.shape != (n_samples,):
+        raise ValueError(f"terminals must have shape ({n_samples},), got {terminals_arr.shape}")
+    if timesteps_arr.shape != (n_samples,):
+        raise ValueError(f"timesteps must have shape ({n_samples},), got {timesteps_arr.shape}")
+
     for name, arr in (("observations", obs), ("actions", actions),
                       ("rewards", rewards), ("terminals", terminals_arr),
                       ("timesteps", timesteps_arr)):
@@ -431,6 +449,8 @@ def train_dynamics_ensemble(
         raise ValueError(f"observations must be numeric, got dtype {obs.dtype}")
     if not np.issubdtype(actions.dtype, np.number):
         raise ValueError(f"actions must be numeric, got dtype {actions.dtype}")
+    if not np.issubdtype(rewards.dtype, np.number):
+        raise ValueError(f"rewards must be numeric, got dtype {rewards.dtype}")
     if not np.isfinite(obs).all():
         raise ValueError("observations contains non-finite values")
     if not np.isfinite(actions).all():
@@ -439,6 +459,8 @@ def train_dynamics_ensemble(
         raise ValueError("rewards contains non-finite values")
     if not np.isfinite(timesteps_arr).all():
         raise ValueError("timesteps contains non-finite values")
+    if not np.issubdtype(timesteps_arr.dtype, np.integer):
+        raise ValueError(f"timesteps must be integer-valued, got dtype {timesteps_arr.dtype}")
     if np.any(timesteps_arr < 0) or np.any(timesteps_arr >= horizon):
         raise ValueError(
             f"timesteps must lie in [0, {horizon - 1}], got "
@@ -470,6 +492,8 @@ def train_dynamics_ensemble(
     is_val = dataset["is_validation"]
     if not (isinstance(is_val, np.ndarray) and np.issubdtype(is_val.dtype, np.bool_)):
         raise ValueError("is_validation must be boolean numpy array")
+    if is_val.shape != (n_samples,):
+        raise ValueError(f"is_validation must have shape ({n_samples},), got {is_val.shape}")
 
     episode_ids = np.asarray(dataset["episode_ids"])
     if episode_ids.shape != (n_samples,):
@@ -499,6 +523,13 @@ def train_dynamics_ensemble(
     reward_valid = _sample_mask(dataset, "rewards_valid", n_samples)
     terminal_valid = _sample_mask(dataset, "terminals_valid", n_samples)
 
+    if "valid_next_states" in dataset:
+        delta_valid = delta_valid & _sample_mask(dataset, "valid_next_states", n_samples)
+    if "valid_rewards" in dataset:
+        reward_valid = reward_valid & _sample_mask(dataset, "valid_rewards", n_samples)
+    if "valid_terminals" in dataset:
+        terminal_valid = terminal_valid & _sample_mask(dataset, "valid_terminals", n_samples)
+
     if not np.isfinite(next_obs[delta_valid]).all():
         raise ValueError(
             "next_observations contains non-finite values at transitions marked "
@@ -508,6 +539,12 @@ def train_dynamics_ensemble(
     if np.sum(delta_valid & train_mask) == 0:
         raise ValueError(
             "Training split has no valid next-state transitions for delta-state supervision; "
+            "provide at least one transition with next_observations_valid=True"
+        )
+
+    if np.sum(delta_valid & val_mask) == 0:
+        raise ValueError(
+            "Validation split has no valid next-state transitions for delta-state supervision; "
             "provide at least one transition with next_observations_valid=True"
         )
 
@@ -527,6 +564,10 @@ def train_dynamics_ensemble(
         train_obs_raw = dataset["observations"][train_mask]
         state_mean = np.mean(train_obs_raw, axis=0, dtype=np.float32)
         state_std = np.maximum(np.std(train_obs_raw, axis=0, dtype=np.float32), 1e-6)
+        norm_provenance = {
+            "source": "dynamics_training_split",
+            "verified": True,
+        }
     else:
         state_mean = np.asarray(state_mean, dtype=np.float32)
         state_std = np.asarray(state_std, dtype=np.float32)
@@ -539,6 +580,15 @@ def train_dynamics_ensemble(
             raise ValueError("state_mean/state_std must be finite")
         if np.any(state_std <= 0):
             raise ValueError("state_std must be strictly positive")
+        if normalization_provenance is not None and isinstance(normalization_provenance, dict):
+            norm_provenance = dict(normalization_provenance)
+            if norm_provenance.get("source") == "dynamics_training_split":
+                raise ValueError("Externally supplied normalization statistics cannot claim source='dynamics_training_split'")
+        else:
+            norm_provenance = {
+                "source": "external_unverified",
+                "verified": False,
+            }
 
     # Normalize observations and compute delta targets. Invalid next states are
     # replaced before normalization so an extreme placeholder cannot overflow or
@@ -570,6 +620,7 @@ def train_dynamics_ensemble(
         state_std=state_std,
         horizon=horizon,
         reward_scale=scale,
+        normalization_provenance=norm_provenance,
     )
 
     ensemble_metrics: list[dict[str, Any]] = []
@@ -602,6 +653,16 @@ def train_dynamics_ensemble(
             boot_rows.extend([rows] * count)
         train_rows = np.concatenate(boot_rows).astype(np.int64)
 
+        valid_delta_count = int(np.sum(delta_valid[train_rows]))
+        valid_reward_count = int(np.sum(reward_valid[train_rows]))
+        valid_terminal_count = int(np.sum(terminal_valid[train_rows]))
+
+        if valid_delta_count == 0:
+            raise RuntimeError(
+                f"Bootstrap head {m_idx} contains 0 valid delta-state transitions. "
+                "Dynamics model cannot be trained without delta-state supervision."
+            )
+
         bootstrap_info = {
             "init_seed": ensemble.init_seeds[m_idx],
             "bootstrap_seed": head_seed,
@@ -610,6 +671,9 @@ def train_dynamics_ensemble(
             "episode_counts": episode_counts,
             "unique_episodes": len(episode_counts),
             "bootstrap_transitions": int(len(train_rows)),
+            "valid_delta_transitions": valid_delta_count,
+            "valid_reward_transitions": valid_reward_count,
+            "valid_terminal_transitions": valid_terminal_count,
         }
 
         # Datasets. Validity masks travel with the batch so each output uses
@@ -653,6 +717,7 @@ def train_dynamics_ensemble(
         train_delta_hist = []
         train_reward_hist = []
         train_terminal_hist = []
+        total_skipped_minibatches = 0
 
         for epoch in range(epochs):
             model.train()
@@ -663,26 +728,37 @@ def train_dynamics_ensemble(
                 b_dz, b_r, b_term = b_dz.to(torch_device), b_r.to(torch_device), b_term.to(torch_device)
                 b_dm, b_rm, b_tm = b_dm.to(torch_device), b_rm.to(torch_device), b_tm.to(torch_device)
 
-                optimizer.zero_grad()
                 pred_dz, pred_r, pred_term = model(b_z, b_a, b_t)
 
                 loss_dz, _ = _masked_mse(pred_dz, b_dz, b_dm)
                 loss_r, _ = _masked_mse(pred_r, b_r, b_rm)
                 loss_term, _ = _masked_bce(pred_term, b_term, b_tm)
 
-                batch_loss = torch.zeros((), device=torch_device)
+                has_supervision = False
+                batch_loss = None
                 if loss_dz is not None:
-                    batch_loss = batch_loss + loss_dz
+                    batch_loss = loss_dz if batch_loss is None else batch_loss + loss_dz
+                    has_supervision = True
                 if loss_r is not None:
-                    batch_loss = batch_loss + w_reward * loss_r
+                    loss_r_weighted = w_reward * loss_r
+                    batch_loss = loss_r_weighted if batch_loss is None else batch_loss + loss_r_weighted
+                    has_supervision = True
                 if loss_term is not None:
-                    batch_loss = batch_loss + w_terminal * loss_term
+                    loss_term_weighted = w_terminal * loss_term
+                    batch_loss = loss_term_weighted if batch_loss is None else batch_loss + loss_term_weighted
+                    has_supervision = True
 
-                batch_loss.backward()
-                optimizer.step()
-
-                train_acc.add(pred_dz.detach(), b_dz, b_dm, pred_r.detach(), b_r, b_rm,
-                              pred_term.detach(), b_term, b_tm)
+                if has_supervision and batch_loss is not None:
+                    optimizer.zero_grad()
+                    batch_loss.backward()
+                    optimizer.step()
+                    train_acc.add(
+                        pred_dz.detach(), b_dz, b_dm,
+                        pred_r.detach(), b_r, b_rm,
+                        pred_term.detach(), b_term, b_tm,
+                    )
+                else:
+                    total_skipped_minibatches += 1
 
             epoch_train_loss = train_acc.weighted_loss(w_reward, w_terminal)
             train_loss_hist.append(epoch_train_loss)
@@ -729,6 +805,7 @@ def train_dynamics_ensemble(
             "train_terminal_loss": train_terminal_hist,
             "best_val_loss": best_val_loss,
             "best_epoch": best_epoch,
+            "skipped_minibatches": total_skipped_minibatches,
             "bootstrap": bootstrap_info,
         })
 
@@ -778,6 +855,20 @@ def save_dynamics_checkpoint(
     if ensemble.horizon is None or ensemble.reward_scale is None:
         raise ValueError("Cannot save dynamics checkpoint without horizon and reward_scale")
 
+    norm_provenance = getattr(ensemble, "normalization_provenance", None) or {}
+    source = norm_provenance.get("source", "external_unverified")
+    verified = norm_provenance.get("verified", False)
+    norm_dict = {
+        "state_mean": np.asarray(ensemble.state_mean).tolist(),
+        "state_std": np.asarray(ensemble.state_std).tolist(),
+        "coordinate_system": "raw_observation",
+        "source": source,
+        "verified": verified,
+    }
+    for k, v in norm_provenance.items():
+        if k not in norm_dict:
+            norm_dict[k] = v
+
     payload = {
         "format_version": 1,
         "kind": "udt_dynamics_ensemble",
@@ -788,12 +879,7 @@ def save_dynamics_checkpoint(
             "hidden_dim": ensemble.models[0].backbone[0].out_features,
             "num_layers": _count_mlp_layers(ensemble.models[0]),
         },
-        "normalization": {
-            "state_mean": np.asarray(ensemble.state_mean).tolist(),
-            "state_std": np.asarray(ensemble.state_std).tolist(),
-            "coordinate_system": "raw_observation",
-            "source": "dynamics_training_split",
-        },
+        "normalization": norm_dict,
         "horizon": int(ensemble.horizon),
         "reward_scale": float(ensemble.reward_scale),
         "loss_weights": {
@@ -829,9 +915,29 @@ def load_dynamics_checkpoint(
     expected_act_dim: int | None = None,
     expected_horizon: int | None = None,
     expected_reward_scale: float | None = None,
+    weights_only: bool = True,
+    allow_unsafe_legacy: bool = False,
 ) -> tuple[DynamicsEnsemble, dict[str, Any]]:
     """Load a dynamics checkpoint and reject incompatible configurations."""
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not weights_only and not allow_unsafe_legacy:
+        raise ValueError(
+            "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
+            "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
+        )
+
+    if allow_unsafe_legacy:
+        import warnings
+        warnings.warn(
+            "Loading checkpoint with unsafe deserialization (weights_only=False). "
+            "Only do this for trusted legacy files.",
+            UserWarning,
+            stacklevel=2,
+        )
+        actual_weights_only = False
+    else:
+        actual_weights_only = True
+
+    payload = torch.load(path, map_location="cpu", weights_only=actual_weights_only)
     if not isinstance(payload, dict) or payload.get("kind") != "udt_dynamics_ensemble":
         raise ValueError(f"{path} is not a U-DT dynamics ensemble checkpoint")
     if payload.get("format_version") != 1:
@@ -872,6 +978,14 @@ def load_dynamics_checkpoint(
     state_mean = np.asarray(norm["state_mean"], dtype=np.float32)
     state_std = np.asarray(norm["state_std"], dtype=np.float32)
 
+    norm_provenance = {
+        "source": norm.get("source", "external_unverified"),
+        "verified": norm.get("verified", False),
+    }
+    for k, v in norm.items():
+        if k not in ("state_mean", "state_std", "coordinate_system", "source", "verified"):
+            norm_provenance[k] = v
+
     ensemble = DynamicsEnsemble(
         state_dim=int(arch["state_dim"]),
         act_dim=int(arch["act_dim"]),
@@ -883,6 +997,7 @@ def load_dynamics_checkpoint(
         state_std=state_std,
         horizon=int(payload["horizon"]),
         reward_scale=float(payload["reward_scale"]),
+        normalization_provenance=norm_provenance,
     )
     state_dicts = payload.get("models_state_dict")
     if not isinstance(state_dicts, list) or len(state_dicts) != ensemble.num_models:
@@ -959,6 +1074,11 @@ class ModuleUController:
         if self.horizon <= 0:
             raise ValueError(f"horizon must be positive, got {resolved_horizon}")
 
+        if ensemble.horizon is not None and ensemble.horizon != self.horizon:
+            raise ValueError(
+                f"Dynamics ensemble horizon ({ensemble.horizon}) != controller horizon ({self.horizon})"
+            )
+
         if ensemble.state_dim != dt_adapter.state_dim:
             raise ValueError(
                 f"Dynamics state_dim ({ensemble.state_dim}) != DT state_dim "
@@ -1000,6 +1120,21 @@ class ModuleUController:
     def reset(self) -> None:
         """Reset the internal DT adapter context for a new episode."""
         self.dt_adapter.reset()
+
+    @property
+    def requires_proposal_rng(self) -> bool:
+        """Whether this controller requires candidate-proposal RNG injection."""
+        return self.num_candidates > 1
+
+    def policy_fn(
+        self,
+        tokens_used: list[float],
+        obs: np.ndarray,
+        step: int,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Policy callback compatible with evaluate_with_budget."""
+        rtg_token = float(tokens_used[-1]) if tokens_used else 0.0
+        return self.get_action(obs=obs, rtg_token=rtg_token, step=step)
 
     def set_rng(self, rng: np.random.Generator) -> None:
         """Inject the evaluation harness candidate-proposal stream."""
@@ -1045,6 +1180,7 @@ class ModuleUController:
                 "selected_index": 0,
                 "candidate_count": 1,
                 "original_action": a_0,
+                "candidate_actions": np.array([a_0]),
                 "at_horizon": step + 1 >= self.horizon,
                 "scorer_mode": self.scorer_mode,
             }
@@ -1105,6 +1241,7 @@ class ModuleUController:
             "selected_index": selected_idx,
             "candidate_count": self.num_candidates,
             "original_action": a_0,
+            "candidate_actions": candidates.copy(),
             "candidate_scores": scores,
             "disagreements": disagreement,
             "at_horizon": at_horizon,

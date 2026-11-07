@@ -72,6 +72,53 @@ def run_variant(
     if variant not in SUPPORTED_VARIANTS:
         raise ValueError(f"Unknown variant {variant!r}; expected one of {SUPPORTED_VARIANTS}")
 
+    # Validate scale and horizon invariants across active components:
+    # c_dynamics == c_return == c_capper == c_rollout
+    # H_dynamics == H_return == H_capper == H_controller == H_rollout
+    if ensemble is not None:
+        if ensemble.reward_scale is not None and not np.isclose(ensemble.reward_scale, reward_scale):
+            raise ValueError(
+                f"Dynamics ensemble reward_scale ({ensemble.reward_scale}) != rollout reward_scale ({reward_scale})"
+            )
+        if ensemble.horizon is not None and ensemble.horizon != horizon:
+            raise ValueError(
+                f"Dynamics ensemble horizon ({ensemble.horizon}) != rollout horizon ({horizon})"
+            )
+
+    if return_model is not None:
+        if not np.isclose(return_model.scale, reward_scale):
+            raise ValueError(
+                f"Return model scale ({return_model.scale}) != rollout reward_scale ({reward_scale})"
+            )
+        if return_model.horizon is not None and return_model.horizon != horizon:
+            raise ValueError(
+                f"Return model horizon ({return_model.horizon}) != rollout horizon ({horizon})"
+            )
+
+    if capper is not None:
+        if not np.isclose(capper.scale, reward_scale):
+            raise ValueError(
+                f"Capper scale ({capper.scale}) != rollout reward_scale ({reward_scale})"
+            )
+        if capper.horizon is not None and capper.horizon != horizon:
+            raise ValueError(
+                f"Capper horizon ({capper.horizon}) != rollout horizon ({horizon})"
+            )
+
+    if capper is not None and return_model is not None:
+        if not np.isclose(capper.scale, return_model.scale):
+            raise ValueError(
+                f"Capper scale ({capper.scale}) != return model scale ({return_model.scale})"
+            )
+        if (
+            capper.horizon is not None
+            and return_model.horizon is not None
+            and capper.horizon != return_model.horizon
+        ):
+            raise ValueError(
+                f"Capper horizon ({capper.horizon}) != return model horizon ({return_model.horizon})"
+            )
+
     if variant in ("B4", "B5"):
         if ensemble is None or return_model is None:
             raise ValueError(f"{variant} requires ensemble and return_model (g_psi)")
@@ -86,16 +133,16 @@ def run_variant(
             action_high=action_high,
             horizon=horizon,
         )
-
-        def policy(tokens, obs, step):
-            rtg_token = tokens[-1] if tokens else 0.0
-            return controller.get_action(obs=obs, rtg_token=rtg_token, step=step)
-
+        policy = controller.policy_fn
         reset_fn = controller.reset
+        set_rng_fn = controller.set_rng
+        requires_proposal_rng = num_candidates > 1
     else:
         controller = None
         policy = dt_adapter.policy_fn
         reset_fn = dt_adapter.reset
+        set_rng_fn = getattr(dt_adapter, "set_rng", None)
+        requires_proposal_rng = False
 
     active_capper = capper if variant in ("B3", "B5") else None
     if variant in ("B3", "B5") and active_capper is None:
@@ -115,6 +162,8 @@ def run_variant(
         action_high=action_high,
         seed=seed,
         policy_reset_fn=reset_fn,
+        policy_set_rng_fn=set_rng_fn,
+        requires_proposal_rng=requires_proposal_rng,
         strict_env_seed=strict_env_seed,
     )
     return VariantRun(variant=variant, rollout=rollout)

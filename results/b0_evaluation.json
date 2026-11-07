@@ -1,0 +1,115 @@
+{
+  "variant": "B0",
+  "env": "Hopper-v4",
+  "checkpoint": "checkpoints/decision_transformer/model.pt",
+  "target_return": 1800.0,
+  "reward_scale": 1000.0,
+  "horizon": 1000,
+  "episodes": 10,
+  "mean_return": 994.409479739563,
+  "std_return": 86.27882329425037,
+  "median_return": 959.9003474990265,
+  "min_return": 913.5955446745896,
+  "max_return": 1157.5347171166632,
+  "mean_length": 330.8,
+  "parity": {
+    "max_abs_difference": 0.0,
+    "tolerance": 1e-06,
+    "passed": true,
+    "status": "pass",
+    "model_source": "real",
+    "steps": 30
+  },
+  "episodes_detail": [
+    {
+      "episode": 1,
+      "seed": 43,
+      "total_reward": 1098.6256432957314,
+      "length": 361,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.7013743567042687
+    },
+    {
+      "episode": 2,
+      "seed": 44,
+      "total_reward": 916.7097498304678,
+      "length": 306,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.883290250169532
+    },
+    {
+      "episode": 3,
+      "seed": 45,
+      "total_reward": 1157.5347171166632,
+      "length": 381,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.6424652828833378
+    },
+    {
+      "episode": 4,
+      "seed": 46,
+      "total_reward": 1103.9899511574772,
+      "length": 365,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.6960100488425235
+    },
+    {
+      "episode": 5,
+      "seed": 47,
+      "total_reward": 913.5955446745896,
+      "length": 303,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.8864044553254116
+    },
+    {
+      "episode": 6,
+      "seed": 48,
+      "total_reward": 976.7115533433756,
+      "length": 334,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.823288446656625
+    },
+    {
+      "episode": 7,
+      "seed": 49,
+      "total_reward": 914.7181762030051,
+      "length": 304,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.8852818237969953
+    },
+    {
+      "episode": 8,
+      "seed": 50,
+      "total_reward": 941.3004488574246,
+      "length": 314,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.8586995511425756
+    },
+    {
+      "episode": 9,
+      "seed": 51,
+      "total_reward": 943.0891416546773,
+      "length": 312,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.8569108583453242
+    },
+    {
+      "episode": 10,
+      "seed": 52,
+      "total_reward": 977.8198712622194,
+      "length": 328,
+      "terminated": true,
+      "truncated": false,
+      "final_raw_budget": 0.822180128737781
+    }
+  ]
+}
