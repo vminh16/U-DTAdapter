@@ -75,7 +75,7 @@ def compute_global_expectile(returns: np.ndarray, tau: float = 0.9, max_iter: in
     """Compute the scalar expectile of a dataset using Iteratively Reweighted Least Squares (IRLS).
 
     Solves the first-order optimality condition:
-        E[ |\\tau - I(Y < c)| * (Y - c) ] = 0
+        (1/n) * sum_i |tau - I(Y_i < c)| * (Y_i - c) = 0
 
     Args:
         returns: 1D array of return values.
@@ -103,6 +103,21 @@ def compute_global_expectile(returns: np.ndarray, tau: float = 0.9, max_iter: in
             return c_next
         c = c_next
     return c
+
+
+def compute_expectile_foc_residual(returns: np.ndarray, expectile: float, tau: float) -> float:
+    """Compute empirical first-order optimality condition (FOC) residual:
+
+        (1/n) * sum_i |tau - I(Y_i < e)| * (Y_i - e)
+
+    For the true minimizer of the expectile loss, this residual must be approximately 0.
+    Expectiles are asymmetric L2 minimizers and do NOT guarantee quantile coverage.
+    """
+    arr = np.asarray(returns, dtype=np.float64).ravel()
+    if arr.size == 0:
+        raise ValueError("Cannot evaluate FOC residual on an empty array")
+    weights = np.where(arr < expectile, 1.0 - tau, tau)
+    return float(np.mean(weights * (arr - expectile)))
 
 
 class GlobalReturnCap:
@@ -295,7 +310,14 @@ class ReturnCapper:
 
         Returns:
             The clipped token B_t to be fed into Decision Transformer.
+
+        Raises:
+            ValueError: If budget.reward_scale != self.scale.
         """
+        if not np.isclose(budget.reward_scale, self.scale):
+            raise ValueError(
+                f"Scale mismatch: ReturnBudget scale ({budget.reward_scale}) != ReturnCapper scale ({self.scale})"
+            )
         cap = self.get_cap(state, step)
         return budget.token(cap=cap, margin=self.margin)
 
@@ -317,6 +339,7 @@ def train_return_cap(
     batch_size: int = 256,
     device: str = "cpu",
     patience: int = 5,
+    seed: int | None = None,
 ) -> tuple[ReturnCapper, dict[str, Any]]:
     """Train the expectile return model g_psi on an audited offline dataset.
 
@@ -338,6 +361,7 @@ def train_return_cap(
         batch_size: Batch size for training.
         device: Torch compute device string ('cpu' or 'cuda').
         patience: Epochs without validation improvement before early stopping.
+        seed: Optional random seed for reproducible training.
 
     Returns:
         A tuple of (ReturnCapper, metrics_dict).
@@ -346,11 +370,66 @@ def train_return_cap(
         if required_key not in dataset:
             raise ValueError(f"Dataset missing required key: {required_key}")
 
+    n_samples = len(dataset["observations"])
+    if n_samples == 0:
+        raise ValueError("Dataset is empty (0 transitions)")
+
+    for key in ("returns_to_go", "timesteps", "is_validation"):
+        if len(dataset[key]) != n_samples:
+            raise ValueError(
+                f"{key} transition count mismatch: {len(dataset[key])} != {n_samples}"
+            )
+
+    is_val = dataset["is_validation"]
+    if not (isinstance(is_val, np.ndarray) and np.issubdtype(is_val.dtype, np.bool_)):
+        raise ValueError(
+            f"is_validation must be a boolean numpy array, got dtype {getattr(is_val, 'dtype', type(is_val))}"
+        )
+
+    if not np.all(np.isfinite(dataset["observations"])):
+        raise ValueError("observations contains non-finite values (NaN or Inf)")
+    if not np.all(np.isfinite(dataset["returns_to_go"])):
+        raise ValueError("returns_to_go contains non-finite values (NaN or Inf)")
+    if not np.all(np.isfinite(dataset["timesteps"])):
+        raise ValueError("timesteps contains non-finite values (NaN or Inf)")
+
+    if horizon <= 0:
+        raise ValueError(f"horizon must be positive, got {horizon}")
+    if scale <= 0 or not np.isfinite(scale):
+        raise ValueError(f"scale must be positive and finite, got {scale}")
+
+    t_arr = dataset["timesteps"]
+    if np.any(t_arr < 0) or np.any(t_arr >= horizon):
+        raise ValueError(
+            f"timesteps out of domain [0, {horizon - 1}]: min={np.min(t_arr)}, max={np.max(t_arr)}"
+        )
+
+    if "horizon" in dataset:
+        ds_horizon = int(np.asarray(dataset["horizon"]).item())
+        if ds_horizon != horizon:
+            raise ValueError(
+                f"Horizon mismatch: dataset horizon ({ds_horizon}) != training horizon ({horizon})"
+            )
+    if "reward_scale" in dataset:
+        ds_scale = float(np.asarray(dataset["reward_scale"]).item())
+        if not np.isclose(ds_scale, scale):
+            raise ValueError(
+                f"Reward scale mismatch: dataset reward_scale ({ds_scale}) != training scale ({scale})"
+            )
+
     train_mask = ~dataset["is_validation"]
     val_mask = dataset["is_validation"]
 
-    if np.sum(train_mask) == 0 or np.sum(val_mask) == 0:
-        raise ValueError("Dataset must contain both training and validation samples")
+    if np.sum(train_mask) == 0:
+        raise ValueError("Dataset must contain training samples")
+    if np.sum(val_mask) == 0:
+        raise ValueError("Dataset must contain validation samples")
+
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     # Handle Baseline B2: Uniform global scalar expectile
     if mode == "global":
@@ -366,11 +445,22 @@ def train_return_cap(
             scale=scale,
             device=device,
         )
+        # Compute true expectile loss for train and val
+        train_diff = train_rtgs - cap_val
+        train_weights = np.where(train_diff < 0.0, 1.0 - tau, tau)
+        train_loss = float(np.mean(train_weights * (train_diff ** 2)))
+
+        val_diff = val_rtgs - cap_val
+        val_weights = np.where(val_diff < 0.0, 1.0 - tau, tau)
+        val_loss = float(np.mean(val_weights * (val_diff ** 2)))
+
         metrics = {
             "cap_value": cap_val,
-            "train_loss": [0.0],
-            "val_loss": [0.0],
+            "train_loss": [train_loss],
+            "val_loss": [val_loss],
             "val_coverage": [val_cov],
+            "best_val_loss": val_loss,
+            "best_epoch": 0,
         }
         return capper, metrics
 
@@ -407,7 +497,16 @@ def train_return_cap(
         torch.from_numpy(val_y),
     )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    train_generator = torch.Generator()
+    if seed is not None:
+        train_generator.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=train_generator,
+    )
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     torch_device = torch.device(device)
@@ -418,7 +517,8 @@ def train_return_cap(
         mode=mode,
     ).to(torch_device)
 
-    criterion = ExpectileLoss(tau=tau, reduction="mean")
+    criterion_train = ExpectileLoss(tau=tau, reduction="mean")
+    criterion_sum = ExpectileLoss(tau=tau, reduction="sum")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     train_loss_hist: list[float] = []
@@ -426,14 +526,15 @@ def train_return_cap(
     val_cov_hist: list[float] = []
 
     best_val_loss = float("inf")
+    best_epoch = 0
     best_weights = copy.deepcopy(model.state_dict())
     stagnant_epochs = 0
 
     for epoch in range(epochs):
         # Training phase
         model.train()
-        total_train_loss = 0.0
-        train_batches = 0
+        total_train_loss_sum = 0.0
+        total_train_samples = 0
         for b_obs, b_t, b_y in train_loader:
             b_obs = b_obs.to(torch_device)
             b_t = b_t.to(torch_device)
@@ -441,22 +542,22 @@ def train_return_cap(
 
             optimizer.zero_grad()
             preds = model(b_obs, b_t)
-            loss = criterion(preds, b_y)
+            loss = criterion_train(preds, b_y)
             loss.backward()
             optimizer.step()
 
-            total_train_loss += loss.item()
-            train_batches += 1
+            batch_sz = b_y.size(0)
+            total_train_loss_sum += loss.item() * batch_sz
+            total_train_samples += batch_sz
 
-        avg_train_loss = total_train_loss / max(1, train_batches)
+        avg_train_loss = total_train_loss_sum / max(1, total_train_samples)
         train_loss_hist.append(avg_train_loss)
 
         # Validation phase
         model.eval()
-        total_val_loss = 0.0
-        val_batches = 0
+        total_val_loss_sum = 0.0
+        total_val_samples = 0
         covered_count = 0
-        total_samples = 0
 
         with torch.no_grad():
             for b_obs, b_t, b_y in val_loader:
@@ -465,24 +566,26 @@ def train_return_cap(
                 b_y = b_y.to(torch_device)
 
                 preds = model(b_obs, b_t)
-                loss = criterion(preds, b_y)
-                total_val_loss += loss.item()
-                val_batches += 1
+                loss_sum = criterion_sum(preds, b_y)
+                total_val_loss_sum += loss_sum.item()
+                batch_sz = b_y.size(0)
+                total_val_samples += batch_sz
 
-                # Empirical quantile coverage: proportion where ground truth return <= cap + margin
+                # Diagnostic empirical coverage: fraction where ground truth return <= cap + margin
+                # Note: Coverage is purely diagnostic; expectiles do NOT have quantile coverage guarantees.
                 covered = (b_y <= preds + margin).sum().item()
                 covered_count += covered
-                total_samples += b_y.numel()
 
-        avg_val_loss = total_val_loss / max(1, val_batches)
-        val_coverage = float(covered_count) / max(1, total_samples)
+        avg_val_loss = total_val_loss_sum / max(1, total_val_samples)
+        val_coverage = float(covered_count) / max(1, total_val_samples)
 
         val_loss_hist.append(avg_val_loss)
         val_cov_hist.append(val_coverage)
 
         # Early stopping tracking
-        if avg_val_loss < best_val_loss - 1e-4:
+        if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            best_epoch = epoch
             best_weights = copy.deepcopy(model.state_dict())
             stagnant_epochs = 0
         else:
@@ -508,5 +611,6 @@ def train_return_cap(
         "val_loss": val_loss_hist,
         "val_coverage": val_cov_hist,
         "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
     }
     return capper, metrics

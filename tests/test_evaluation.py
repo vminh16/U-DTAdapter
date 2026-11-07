@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from udt.intervention import ReturnBudget
 from udt.return_cap import GlobalReturnCap, ReturnCapMLP, ReturnCapper
 
 from udt.evaluation import evaluate_with_budget, RolloutResult
@@ -119,5 +120,34 @@ def test_evaluate_with_budget_neural_mlp_b3():
     # Raw budget starts at 2.0 and ends at 2.0 - (10 * 5) / 1000 = 1.95
     assert np.isclose(result.raw_budgets[0], 2.0)
     assert np.isclose(result.final_raw_budget, 1.95)
+
+
+def test_evaluate_with_budget_rejects_scale_mismatch():
+    env = MockEnvironment()
+    capper = ReturnCapper(model=GlobalReturnCap(1.0), horizon=20, scale=500.0)
+    with pytest.raises(ValueError, match="Reward scale mismatch"):
+        evaluate_with_budget(env, mock_policy, capper=capper, horizon=20, reward_scale=1000.0)
+
+
+def test_evaluate_with_budget_rejects_horizon_mismatch():
+    env = MockEnvironment()
+    capper = ReturnCapper(model=GlobalReturnCap(1.0), horizon=50, scale=1000.0)
+    with pytest.raises(ValueError, match="Horizon mismatch"):
+        evaluate_with_budget(env, mock_policy, capper=capper, horizon=20, reward_scale=1000.0)
+
+
+def test_evaluate_with_budget_rejects_non_positive_horizon_or_scale():
+    env = MockEnvironment()
+    with pytest.raises(ValueError, match="horizon must be positive"):
+        evaluate_with_budget(env, mock_policy, horizon=0)
+    with pytest.raises(ValueError, match="reward_scale must be positive"):
+        evaluate_with_budget(env, mock_policy, reward_scale=-10.0)
+
+
+def test_capper_step_rejects_scale_mismatch():
+    capper = ReturnCapper(model=GlobalReturnCap(1.0), horizon=100, scale=1000.0)
+    budget = ReturnBudget(raw=5.0, reward_scale=500.0)
+    with pytest.raises(ValueError, match="Scale mismatch"):
+        capper.step(budget, state=np.zeros(4), step=0)
 
 

@@ -121,3 +121,58 @@ def test_download_dataset_validates_hdf5_format(tmp_path):
             download_dataset("hopper-medium-v2", target_dir=tmp_path)
 
     assert not (tmp_path / "hopper_medium-v2.hdf5").exists()
+
+
+def test_download_dataset_zero_bytes_rejected(tmp_path):
+    mock_resp = MagicMock()
+    mock_resp.read.side_effect = [b""]
+    mock_resp.headers.get.return_value = "0"
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(OSError, match="0 bytes"):
+            download_dataset("hopper-medium-v2", target_dir=tmp_path)
+
+
+def test_download_dataset_sha256_verification(tmp_path):
+    import hashlib
+    content = make_dummy_hdf5_bytes()
+    expected_hash = hashlib.sha256(content).hexdigest()
+
+    mock_resp = MagicMock()
+    mock_resp.read.side_effect = [content, b""]
+    mock_resp.headers.get.return_value = str(len(content))
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+
+    # Mismatch hash should raise OSError
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(OSError, match="SHA-256 mismatch"):
+            download_dataset("hopper-medium-v2", target_dir=tmp_path, expected_sha256="deadbeef" * 8)
+
+    # Correct hash should pass
+    mock_resp.read.side_effect = [content, b""]
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        out = download_dataset("hopper-medium-v2", target_dir=tmp_path, expected_sha256=expected_hash)
+        assert out.exists()
+
+
+def test_download_dataset_corrupted_cached_file_triggers_redownload(tmp_path):
+    dest = tmp_path / "hopper_medium-v2.hdf5"
+    dest.write_bytes(b"corrupted not hdf5")
+
+    content = make_dummy_hdf5_bytes()
+    mock_resp = MagicMock()
+    mock_resp.read.side_effect = [content, b""]
+    mock_resp.headers.get.return_value = str(len(content))
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+
+    # Force is False, but since dest is corrupted, it should re-download!
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        out = download_dataset("hopper-medium-v2", target_dir=tmp_path, force=False)
+        assert out == dest
+        assert out.read_bytes() == content
+        mock_urlopen.assert_called_once()
+

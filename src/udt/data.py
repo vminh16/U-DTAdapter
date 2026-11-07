@@ -12,38 +12,91 @@ import h5py
 import numpy as np
 
 
-FIELDS = ('observations', 'next_observations', 'actions', 'rewards', 'terminals')
+MANDATORY_FIELDS = ('observations', 'actions', 'rewards', 'terminals')
+OPTIONAL_FIELDS = ('next_observations', 'timeouts')
 
 
-def validate_dataset(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Validate a flat, ordered dataset without silently converting bad flags."""
-    missing = set(FIELDS) - data.keys()
+def validate_dataset(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate a flat, ordered dataset preserving field provenance."""
+    missing = set(MANDATORY_FIELDS) - data.keys()
     if missing:
         raise ValueError(f'Missing dataset fields: {sorted(missing)}')
-    arrays = {key: np.asarray(data[key]) for key in FIELDS}
-    arrays['timeouts'] = np.asarray(data.get('timeouts', np.zeros(len(arrays['rewards']))))
+
+    arrays: dict[str, Any] = {}
+    for key in MANDATORY_FIELDS:
+        arrays[key] = np.asarray(data[key])
+
     n = len(arrays['rewards'])
     if not n:
         raise ValueError('Dataset is empty')
-    for key, value in arrays.items():
-        if value.ndim == 0 or len(value) != n:
-            raise ValueError(f'{key}: inconsistent transition count')
-        if not np.issubdtype(value.dtype, np.number) and value.dtype != np.bool_:
+
+    # Validate 1D mandatory fields
+    for key in ('rewards', 'terminals'):
+        val = arrays[key]
+        if val.ndim == 0 or len(val) != n or val.shape != (n,):
+            raise ValueError(f'{key}: inconsistent transition count or shape')
+        if not np.issubdtype(val.dtype, np.number) and val.dtype != np.bool_:
             raise ValueError(f'{key}: expected numeric data')
-        if not np.isfinite(value).all():
+        if not np.isfinite(val).all():
             raise ValueError(f'{key}: non-finite data')
-    for key in ('rewards', 'terminals', 'timeouts'):
-        if arrays[key].shape != (n,):
-            raise ValueError(f'{key}: expected shape (N,)')
-    for key in ('observations', 'next_observations', 'actions'):
-        if arrays[key].ndim != 2 or arrays[key].shape[1] == 0:
+
+    if not np.isin(arrays['terminals'], [0, 1]).all():
+        raise ValueError('terminals: flags must be 0 or 1')
+    arrays['terminals'] = arrays['terminals'].astype(bool)
+
+    # Validate 2D mandatory fields
+    for key in ('observations', 'actions'):
+        val = arrays[key]
+        if val.ndim != 2 or len(val) != n or val.shape[1] == 0:
             raise ValueError(f'{key}: expected shape (N, dimension)')
-    if arrays['observations'].shape != arrays['next_observations'].shape:
-        raise ValueError('Observation and next-observation shapes differ')
-    for key in ('terminals', 'timeouts'):
-        if not np.isin(arrays[key], [0, 1]).all():
-            raise ValueError(f'{key}: flags must be 0 or 1')
-        arrays[key] = arrays[key].astype(bool)
+        if not np.issubdtype(val.dtype, np.number) and val.dtype != np.bool_:
+            raise ValueError(f'{key}: expected numeric data')
+        if not np.isfinite(val).all():
+            raise ValueError(f'{key}: non-finite data')
+
+    # Provenance for timeouts
+    has_original_timeouts = (
+        'timeouts' in data and data.get('timeouts_source') != 'missing'
+    )
+    if has_original_timeouts:
+        timeouts_arr = np.asarray(data['timeouts'])
+        if timeouts_arr.ndim == 0 or len(timeouts_arr) != n or timeouts_arr.shape != (n,):
+            raise ValueError('timeouts: inconsistent transition count or shape')
+        if not np.issubdtype(timeouts_arr.dtype, np.number) and timeouts_arr.dtype != np.bool_:
+            raise ValueError('timeouts: expected numeric data')
+        if not np.isfinite(timeouts_arr).all():
+            raise ValueError('timeouts: non-finite data')
+        if not np.isin(timeouts_arr, [0, 1]).all():
+            raise ValueError('timeouts: flags must be 0 or 1')
+        arrays['timeouts'] = timeouts_arr.astype(bool)
+        arrays['timeouts_source'] = 'original'
+        arrays['has_original_timeouts'] = True
+    else:
+        arrays['timeouts'] = np.zeros(n, dtype=bool)
+        arrays['timeouts_source'] = 'missing'
+        arrays['has_original_timeouts'] = False
+
+    # Provenance for next_observations
+    has_original_next_obs = (
+        'next_observations' in data and data.get('next_observations_source') != 'missing'
+    )
+    if has_original_next_obs:
+        next_obs = np.asarray(data['next_observations'])
+        if next_obs.ndim != 2 or len(next_obs) != n or next_obs.shape[1] == 0:
+            raise ValueError('next_observations: expected shape (N, dimension)')
+        if next_obs.shape != arrays['observations'].shape:
+            raise ValueError('Observation and next-observation shapes differ')
+        if not np.issubdtype(next_obs.dtype, np.number) and next_obs.dtype != np.bool_:
+            raise ValueError('next_observations: expected numeric data')
+        if not np.isfinite(next_obs).all():
+            raise ValueError('next_observations: non-finite data')
+        arrays['next_observations'] = next_obs
+        arrays['next_observations_source'] = 'original'
+        arrays['has_original_next_observations'] = True
+    else:
+        arrays['next_observations_source'] = 'missing'
+        arrays['has_original_next_observations'] = False
+
     return arrays
 
 
@@ -82,15 +135,6 @@ def load_dataset(path: str | Path) -> dict[str, np.ndarray]:
     else:
         raise ValueError(f"Unsupported dataset format: {suffix}. Expected .hdf5, .h5, or .npz")
 
-    # If next_observations is missing but observations is present, construct via shift
-    if "next_observations" not in data and "observations" in data and len(data["observations"]) > 0:
-        obs = data["observations"]
-        data["next_observations"] = np.vstack([obs[1:], obs[-1:]])
-
-    # If timeouts is missing, initialize as zeros
-    if "timeouts" not in data and "rewards" in data:
-        data["timeouts"] = np.zeros(len(data["rewards"]), dtype=bool)
-
     return data
 
 
@@ -110,12 +154,14 @@ def audit_dataset(data: dict[str, np.ndarray], *, horizon: int,
         raise ValueError('continuity_atol must be finite and nonnegative')
     arrays = validate_dataset(data)
     n = len(arrays['rewards'])
+    has_timeouts = arrays['has_original_timeouts']
+    has_next_obs = arrays['has_original_next_observations']
     segments = []
     start = 0
     known_start = bool(starts_at_reset)
     for i in range(n):
         terminal = bool(arrays['terminals'][i])
-        timeout = bool(arrays['timeouts'][i])
+        timeout = bool(arrays['timeouts'][i]) if has_timeouts else False
         length = i - start + 1
         next_start_known = False
         reason = None
@@ -125,12 +171,12 @@ def audit_dataset(data: dict[str, np.ndarray], *, horizon: int,
             reason = 'terminal'
             next_start_known = True
         elif timeout:
-            if timeout_semantics == 'horizon' and known_start and length == horizon:
+            if timeout_semantics == 'horizon' and known_start and length == horizon and has_timeouts:
                 reason = 'horizon'
                 next_start_known = True
             else:
                 reason = 'unverified_timeout'
-        elif i + 1 < n and not np.allclose(
+        elif has_next_obs and i + 1 < n and not np.allclose(
             arrays['next_observations'][i], arrays['observations'][i + 1],
             rtol=0, atol=continuity_atol,
         ):
@@ -151,8 +197,10 @@ def audit_dataset(data: dict[str, np.ndarray], *, horizon: int,
     eligible = [segment for segment in segments if segment['rtg_eligible']]
     retained = sum(segment['length'] for segment in eligible)
     warnings = []
-    if 'timeouts' not in data:
+    if not has_timeouts:
         warnings.append('Missing timeouts: horizon endings cannot be verified.')
+    if not has_next_obs:
+        warnings.append('Missing original next_observations; inter-step continuity cannot be verified from next-state.')
     if not starts_at_reset:
         warnings.append('First segment has unknown episode start/time.')
     if retained < n:
@@ -163,6 +211,10 @@ def audit_dataset(data: dict[str, np.ndarray], *, horizon: int,
         'schema_version': 1, 'transitions': n, 'horizon': horizon,
         'timeout_semantics': timeout_semantics, 'starts_at_reset': starts_at_reset,
         'continuity_atol': continuity_atol,
+        'has_original_timeouts': has_timeouts,
+        'timeouts_source': arrays['timeouts_source'],
+        'has_original_next_observations': has_next_obs,
+        'next_observations_source': arrays['next_observations_source'],
         'segment_count': len(segments), 'rtg_eligible_episodes': len(eligible),
         'rtg_eligible_transitions': retained, 'excluded_transitions': n - retained,
         'retained_fraction': retained / n,
@@ -192,10 +244,14 @@ def prepare_dataset(data: dict[str, np.ndarray], *, horizon: int,
     if len(episodes) < 2:
         raise ValueError('Need at least two verified episodes for a trajectory split')
     arrays = validate_dataset(data)
+    has_next_obs = arrays['has_original_next_observations']
     ids = np.array([e['id'] for e in episodes])
     nval = min(len(ids) - 1, max(1, int(np.ceil(len(ids) * validation_fraction))))
     val_ids = np.random.default_rng(seed).permutation(ids)[:nval]
     indices, rtgs, timesteps, episode_ids = [], [], [], []
+    inferred_next_obs = []
+    next_obs_valid = []
+
     for episode in episodes:
         rows = np.arange(episode['start'], episode['stop'])
         rewards = arrays['rewards'][rows].astype(np.float64) / reward_scale
@@ -203,14 +259,41 @@ def prepare_dataset(data: dict[str, np.ndarray], *, horizon: int,
         rtgs.extend(np.cumsum(rewards[::-1])[::-1])
         timesteps.extend(range(len(rows)))
         episode_ids.extend([episode['id']] * len(rows))
+
+        if has_next_obs:
+            next_obs_valid.extend([True] * len(rows))
+        else:
+            ep_obs = arrays['observations'][rows]
+            L = len(rows)
+            for k in range(L):
+                if k < L - 1:
+                    inferred_next_obs.append(ep_obs[k + 1])
+                    next_obs_valid.append(True)
+                else:
+                    # Terminal transition: post-terminal state is not observed
+                    inferred_next_obs.append(ep_obs[k].copy())
+                    next_obs_valid.append(False)
+
     rows = np.asarray(indices, dtype=np.int64)
-    result = {k: v[rows] for k, v in arrays.items()}
-    result.update({
-        'source_indices': rows, 'returns_to_go': np.asarray(rtgs),
+    result = {
+        'observations': arrays['observations'][rows],
+        'actions': arrays['actions'][rows],
+        'rewards': arrays['rewards'][rows],
+        'terminals': arrays['terminals'][rows],
+        'timeouts': arrays['timeouts'][rows],
+        'source_indices': rows,
+        'returns_to_go': np.asarray(rtgs),
         'timesteps': np.asarray(timesteps, dtype=np.int64),
         'episode_ids': np.asarray(episode_ids, dtype=np.int64),
         'scaled_rewards': arrays['rewards'][rows].astype(np.float64) / reward_scale,
-    })
+    }
+    if has_next_obs:
+        result['next_observations'] = arrays['next_observations'][rows]
+        result['next_observations_valid'] = np.ones(len(rows), dtype=bool)
+    else:
+        result['next_observations'] = np.asarray(inferred_next_obs)
+        result['next_observations_valid'] = np.asarray(next_obs_valid, dtype=bool)
+
     result['is_validation'] = np.isin(result['episode_ids'], val_ids)
     train_obs = result['observations'][~result['is_validation']].astype(np.float64)
     manifest = {
@@ -221,6 +304,11 @@ def prepare_dataset(data: dict[str, np.ndarray], *, horizon: int,
         'state_mean': train_obs.mean(axis=0).tolist(),
         'state_std': np.maximum(train_obs.std(axis=0), 1e-6).tolist(),
         'retained_transitions': len(rows), 'dropped_transitions': len(arrays['rewards']) - len(rows),
+        'has_original_next_observations': has_next_obs,
+        'next_observations_source': 'original' if has_next_obs else 'inferred',
+        'valid_next_observations_count': int(result['next_observations_valid'].sum()),
+        'has_original_timeouts': arrays['has_original_timeouts'],
+        'timeouts_source': arrays['timeouts_source'],
         'label_population': 'verified complete episodes only; selection bias not corrected',
         'audit': report,
     }

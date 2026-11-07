@@ -45,3 +45,25 @@ def test_cli_rejects_pickle_and_bad_data_with_actionable_message(tmp_path):
     assert result.returncode != 0
     assert 'NPZ or HDF5' in result.stderr
     assert not (tmp_path / 'a.json').exists()
+
+
+def test_cli_verify_u_command():
+    result = invoke('verify-u')
+    assert result.returncode == 0, result.stderr
+    assert "MODULE U: RIGOROUS MATHEMATICAL & NUMERICAL VERIFICATION" in result.stdout
+    assert "ALL MODULE U INVARIANTS VERIFIED!" in result.stdout
+
+
+def test_cli_train_u_roundtrip(tmp_path):
+    source = tmp_path / 'demo.npz'
+    assert invoke('demo-data', '--output', source).returncode == 0
+    prepared_dir = tmp_path / 'prep'
+    assert invoke('prepare', source, '--horizon', 3, '--starts-at-reset',
+                  '--timeout-semantics', 'horizon', '--output', prepared_dir).returncode == 0
+
+    ckpt_dir = tmp_path / 'checkpoints_u'
+    result = invoke('train-u', '--data', prepared_dir / 'dataset.npz', '--horizon', 3,
+                    '--output', ckpt_dir, '--num-models', 2, '--epochs', 2, '--seed', 42)
+    assert result.returncode == 0, result.stderr
+    assert (ckpt_dir / 'dynamics_ensemble.pt').exists()
+

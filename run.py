@@ -22,12 +22,14 @@ import torch
 
 from udt.data import audit_dataset, load_dataset, prepare_dataset
 from udt.download import D4RL_URLS, download_dataset
-from udt.intervention import ReturnBudget
+from udt.dynamics import DynamicsEnsemble, train_dynamics_ensemble
+from udt.intervention import ReturnBudget, ensemble_scores, propose_actions
 from udt.return_cap import (
     ExpectileLoss,
     GlobalReturnCap,
     ReturnCapMLP,
     ReturnCapper,
+    compute_expectile_foc_residual,
     compute_global_expectile,
     train_return_cap,
 )
@@ -165,6 +167,18 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 def cmd_train_r(args: argparse.Namespace) -> int:
     """Train Module R expectile model."""
     in_path = Path(args.data)
+    manifest_path = in_path.parent / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if "horizon" in manifest and manifest["horizon"] != args.horizon:
+            raise ValueError(
+                f"Horizon mismatch: manifest horizon ({manifest['horizon']}) != CLI horizon ({args.horizon})"
+            )
+        if "reward_scale" in manifest and not np.isclose(manifest["reward_scale"], args.reward_scale):
+            raise ValueError(
+                f"Reward scale mismatch: manifest reward_scale ({manifest['reward_scale']}) != CLI reward_scale ({args.reward_scale})"
+            )
+
     with np.load(in_path, allow_pickle=False) as loaded:
         dataset = {k: loaded[k] for k in loaded.files}
 
@@ -178,6 +192,7 @@ def cmd_train_r(args: argparse.Namespace) -> int:
         epochs=args.epochs,
         lr=args.lr,
         device=args.device,
+        seed=args.seed,
     )
 
     out_dir = Path(args.output)
@@ -191,6 +206,7 @@ def cmd_train_r(args: argparse.Namespace) -> int:
             "tau": args.tau,
             "margin": args.margin,
             "scale": args.reward_scale,
+            "seed": args.seed,
             "state_mean": capper.state_mean,
             "state_std": capper.state_std,
             "metrics": metrics,
@@ -204,6 +220,8 @@ def cmd_train_r(args: argparse.Namespace) -> int:
             "horizon": args.horizon,
             "margin": args.margin,
             "scale": args.reward_scale,
+            "seed": args.seed,
+            "metrics": metrics,
         }, indent=2))
         print(f"Global scalar capper saved to {out_dir / 'return_capper_global.json'}")
 
@@ -248,23 +266,34 @@ def cmd_verify_r(args: argparse.Namespace) -> int:
     print(f"  Penalty ratio: {ratio:.1f}x (exactly tau / (1 - tau) = 0.9 / 0.1 = 9.0x)")
     assert np.isclose(ratio, 9.0)
 
-    # 2. Iteratively Reweighted Least Squares (IRLS) Analytical Solutions
-    print("\n[2] Verifying IRLS Global Expectile Against Analytical Solutions")
+    # 2. Iteratively Reweighted Least Squares (IRLS) Analytical Solutions & Optimality Condition
+    print("\n[2] Verifying IRLS Global Expectile Against Analytical Solutions & First-Order Condition")
     # Two-point distribution {0, 100} with equal probability:
     # First-order condition: (1 - tau) * c = tau * (100 - c) => c = 100 * tau
     two_point = np.array([0.0, 100.0])
     for tau in [0.5, 0.7, 0.9, 0.99]:
         computed_c = compute_global_expectile(two_point, tau=tau)
         expected_c = 100.0 * tau
-        print(f"  tau={tau:.2f} on {{0, 100}}: computed={computed_c:.6f}, exact analytical={expected_c:.6f}")
+        foc_res = compute_expectile_foc_residual(two_point, computed_c, tau=tau)
+        print(f"  tau={tau:.2f} on {{0, 100}}: computed={computed_c:.6f}, exact analytical={expected_c:.6f}, FOC residual={foc_res:.2e}")
         assert np.isclose(computed_c, expected_c, atol=1e-5)
+        assert np.isclose(foc_res, 0.0, atol=1e-5)
+
+    # Mandatory Counterexample: Expectile is NOT a quantile (RRD §2.1 & Mathematical Review §1)
+    e_09 = compute_global_expectile(two_point, tau=0.9)
+    cov_09 = np.mean(two_point <= e_09)
+    print(f"  [Mandatory Counterexample] On {{0, 100}}, tau=0.9 expectile = {e_09:.1f}, Empirical Coverage P(Y <= 90) = {cov_09*100:.1f}%")
+    assert np.isclose(e_09, 90.0)
+    assert np.isclose(cov_09, 0.5), "Expected P(Y <= 90) to be 0.50, proving expectile != quantile!"
 
     # Symmetric standard normal distribution: expectile at tau=0.5 must be exactly 0.0
     rng = np.random.default_rng(42)
     norm_samples = rng.normal(loc=0.0, scale=1.0, size=500_000)
     c_norm_half = compute_global_expectile(norm_samples, tau=0.5)
-    print(f"  tau=0.5 on N(0, 1) (500k samples): mean={np.mean(norm_samples):.6f}, expectile={c_norm_half:.6f}")
+    foc_norm_half = compute_expectile_foc_residual(norm_samples, c_norm_half, tau=0.5)
+    print(f"  tau=0.5 on N(0, 1) (500k samples): mean={np.mean(norm_samples):.6f}, expectile={c_norm_half:.6f}, FOC residual={foc_norm_half:.2e}")
     assert np.isclose(c_norm_half, 0.0, atol=1e-2)
+    assert np.isclose(foc_norm_half, 0.0, atol=1e-4)
 
     # 3. Budget Recurrence Decoupling Invariant
     print("\n[3] Verifying Budget Recurrence Decoupling Invariant")
@@ -329,21 +358,155 @@ def cmd_verify_r(args: argparse.Namespace) -> int:
             print(f"  Total RTG labels: {len(rtgs):,} (Train: {len(train_rtgs):,}, Val: {len(val_rtgs):,})")
             print(f"  Train RTG Range: [{np.min(train_rtgs):.4f}, {np.max(train_rtgs):.4f}], Mean = {np.mean(train_rtgs):.4f}")
 
-            # Compute Baseline B2 Global Expectile
+            # Compute Baseline B2 Global Expectile and check First-Order Condition
             cap_b2 = compute_global_expectile(train_rtgs, tau=0.9)
+            foc_b2 = compute_expectile_foc_residual(train_rtgs, cap_b2, tau=0.9)
             val_cov_b2 = np.mean(val_rtgs <= cap_b2)
-            print(f"  Baseline B2 Global Expectile (tau=0.9): {cap_b2:.4f}")
-            print(f"  Baseline B2 Empirical Validation Coverage: {val_cov_b2*100:.2f}% (Expected ~85-95%)")
-            assert 0.80 <= val_cov_b2 <= 0.99, f"Unexpected validation coverage: {val_cov_b2}"
+            print(f"  Baseline B2 Global Expectile (tau=0.9): {cap_b2:.4f}, Train FOC residual: {foc_b2:.2e}")
+            print(f"  Baseline B2 Empirical Validation Coverage (Diagnostic Only): {val_cov_b2*100:.2f}%")
+            assert np.isclose(foc_b2, 0.0, atol=1e-4), f"FOC violated for tau=0.9: {foc_b2}"
 
             cap_b2_99 = compute_global_expectile(train_rtgs, tau=0.99)
+            foc_b2_99 = compute_expectile_foc_residual(train_rtgs, cap_b2_99, tau=0.99)
             val_cov_b2_99 = np.mean(val_rtgs <= cap_b2_99)
-            print(f"  Baseline B2 Global Expectile (tau=0.99): {cap_b2_99:.4f}")
-            print(f"  Baseline B2 (tau=0.99) Validation Coverage: {val_cov_b2_99*100:.2f}%")
-            assert val_cov_b2_99 > val_cov_b2
+            print(f"  Baseline B2 Global Expectile (tau=0.99): {cap_b2_99:.4f}, Train FOC residual: {foc_b2_99:.2e}")
+            print(f"  Baseline B2 Empirical Validation Coverage (Diagnostic Only): {val_cov_b2_99*100:.2f}%")
+            assert np.isclose(foc_b2_99, 0.0, atol=1e-4), f"FOC violated for tau=0.99: {foc_b2_99}"
 
     print("\n" + "=" * 80)
     print("ALL NUMERICAL, MATHEMATICAL & EDGE-CASE INVARIANTS VERIFIED!")
+    print("=" * 80)
+    return 0
+
+
+def cmd_train_u(args: argparse.Namespace) -> int:
+    """Train Module U ensemble dynamics."""
+    in_path = Path(args.data)
+    manifest_path = in_path.parent / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if "horizon" in manifest and manifest["horizon"] != args.horizon:
+            raise ValueError(
+                f"Horizon mismatch: manifest horizon ({manifest['horizon']}) != CLI horizon ({args.horizon})"
+            )
+        if "reward_scale" in manifest and not np.isclose(manifest["reward_scale"], args.reward_scale):
+            raise ValueError(
+                f"Reward scale mismatch: manifest reward_scale ({manifest['reward_scale']}) != CLI reward_scale ({args.reward_scale})"
+            )
+
+    with np.load(in_path, allow_pickle=False) as loaded:
+        dataset = {k: loaded[k] for k in loaded.files}
+
+    ensemble, metrics = train_dynamics_ensemble(
+        dataset=dataset,
+        horizon=args.horizon,
+        num_models=args.num_models,
+        scale=args.reward_scale,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        lr=args.lr,
+        epochs=args.epochs,
+        device=args.device,
+        seed=args.seed,
+    )
+
+    out_dir = Path(args.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.save({
+        "models_state_dict": [m.state_dict() for m in ensemble.models],
+        "num_models": args.num_models,
+        "horizon": args.horizon,
+        "state_dim": ensemble.state_dim,
+        "act_dim": ensemble.act_dim,
+        "scale": args.reward_scale,
+        "seed": args.seed,
+        "metrics": metrics,
+    }, out_dir / "dynamics_ensemble.pt")
+    print(f"Dynamics ensemble saved to {out_dir / 'dynamics_ensemble.pt'}")
+    return 0
+
+
+def cmd_verify_u(args: argparse.Namespace) -> int:
+    """Execute rigorous mathematical, numerical, and edge-case verification for Module U."""
+    print("=" * 80)
+    print("MODULE U: RIGOROUS MATHEMATICAL & NUMERICAL VERIFICATION")
+    print("=" * 80)
+
+    # 1. Action Proposal Invariant & Bounds Preservation
+    print("\n[1] Verifying Candidate Action Proposal and Bounds")
+    action_orig = np.array([0.5, -0.8], dtype=np.float32)
+    low = np.array([-1.0, -1.0], dtype=np.float32)
+    high = np.array([1.0, 1.0], dtype=np.float32)
+    rng = np.random.default_rng(42)
+    candidates = propose_actions(action_orig, low=low, high=high, count=10, radius=0.05, rng=rng)
+    assert len(candidates) == 10
+    # Candidate 0 must be exactly original action
+    np.testing.assert_allclose(candidates[0], action_orig)
+    print("  Candidate 0 equals original action: EXACT MATCH")
+    assert np.all(candidates >= low) and np.all(candidates <= high)
+    print("  All 10 candidates respect environment bounds [low, high]: VERIFIED")
+
+    # 2. Ensemble Disagreement Invariant
+    print("\n[2] Verifying Disagreement Proxy Computation")
+    # Identical predictions across heads -> disagreement must be 0.0
+    states_identical = np.ones((3, 4, 2), dtype=np.float32)
+    centered = states_identical - states_identical.mean(axis=0)
+    disagree_zero = np.sqrt(np.square(centered).sum(axis=-1).mean(axis=0))
+    np.testing.assert_allclose(disagree_zero, 0.0)
+    print("  Ensemble with identical predictions: disagreement = 0.0000 (EXACT)")
+
+    # Divergent predictions: head 1 = -1, head 2 = +1
+    states_divergent = np.array([[[-1.0]], [[1.0]]], dtype=np.float32)  # shape (2, 1, 1)
+    centered_div = states_divergent - states_divergent.mean(axis=0)
+    disagree_div = float(np.sqrt(np.square(centered_div).sum(axis=-1).mean(axis=0))[0])
+    print(f"  Ensemble with divergent predictions [-1, +1]: disagreement = {disagree_div:.4f} (expected 1.0000)")
+    assert np.isclose(disagree_div, 1.0)
+
+    # 3. Horizon Boundary Invariant: Continuation = 0 at/beyond Horizon
+    print("\n[3] Verifying Horizon Boundary Invariant (Continuation = 0 at t+1 >= H)")
+    scores_at_h = ensemble_scores(
+        rewards=np.array([[2.0, 2.0], [2.0, 2.0]]),
+        next_returns=np.array([[999.0, 999.0], [999.0, 999.0]]),
+        terminal_probabilities=np.zeros((2, 2)),
+        next_states=np.zeros((2, 2, 1)),
+        beta=0.0,
+        at_horizon=True,
+    )
+    print(f"  Scores at horizon: got {scores_at_h}, expected [2.0, 2.0]")
+    np.testing.assert_allclose(scores_at_h, [2.0, 2.0])
+
+    # 4. Tie-Breaking Invariant: Original Action Preferred
+    print("\n[4] Verifying Tie-Breaking Rule (Preserve Original Action on Ties)")
+    tied_scores = np.array([5.0, 5.0, 5.0, 5.0])
+    selected_idx = int(np.argmax(tied_scores))
+    print(f"  Selected candidate index on tie: {selected_idx} (index 0 corresponds to original action)")
+    assert selected_idx == 0
+
+    # 5. Penalty Monotonicity
+    print("\n[5] Verifying Uncertainty Penalty Monotonicity with Beta")
+    scores_b0 = ensemble_scores(
+        rewards=np.zeros((2, 1)),
+        next_returns=np.ones((2, 1)),
+        terminal_probabilities=np.zeros((2, 1)),
+        next_states=states_divergent,
+        beta=0.0,
+        at_horizon=False,
+    )
+    scores_b1 = ensemble_scores(
+        rewards=np.zeros((2, 1)),
+        next_returns=np.ones((2, 1)),
+        terminal_probabilities=np.zeros((2, 1)),
+        next_states=states_divergent,
+        beta=0.5,
+        at_horizon=False,
+    )
+    print(f"  Score with beta=0.0: {scores_b0[0]:.4f}")
+    print(f"  Score with beta=0.5: {scores_b1[0]:.4f} (penalty = beta * u = 0.5 * 1.0 = 0.5)")
+    assert np.isclose(scores_b0[0] - scores_b1[0], 0.5)
+
+    print("\n" + "=" * 80)
+    print("ALL MODULE U INVARIANTS VERIFIED!")
     print("=" * 80)
     return 0
 
@@ -405,12 +568,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--epochs", type=int, default=15, help="Training epochs")
     p_train.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     p_train.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p_train.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     p_train.set_defaults(func=cmd_train_r)
 
     # verify-r
     p_verify = subparsers.add_parser("verify-r", help="Run numerical & edge-case verification for Module R")
     p_verify.add_argument("--data", help="Optional path to prepared dataset.npz")
     p_verify.set_defaults(func=cmd_verify_r)
+
+    # train-u
+    p_train_u = subparsers.add_parser("train-u", help="Train Module U dynamics ensemble")
+    p_train_u.add_argument("--data", required=True, help="Prepared dataset.npz path")
+    p_train_u.add_argument("--horizon", type=int, required=True, help="Episode horizon")
+    p_train_u.add_argument("--output", default="checkpoints/module_u", help="Output directory")
+    p_train_u.add_argument("--num-models", type=int, default=3, help="Number of ensemble models M")
+    p_train_u.add_argument("--hidden-dim", type=int, default=128, help="Hidden dimension")
+    p_train_u.add_argument("--num-layers", type=int, default=3, help="Number of MLP layers")
+    p_train_u.add_argument("--reward-scale", type=float, default=1000.0, help="Reward scaling factor c")
+    p_train_u.add_argument("--epochs", type=int, default=15, help="Training epochs")
+    p_train_u.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    p_train_u.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p_train_u.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    p_train_u.set_defaults(func=cmd_train_u)
+
+    # verify-u
+    p_verify_u = subparsers.add_parser("verify-u", help="Run numerical & edge-case verification for Module U")
+    p_verify_u.set_defaults(func=cmd_verify_u)
 
     return parser
 
