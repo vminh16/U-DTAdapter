@@ -9,8 +9,10 @@ from udt.return_cap import (
     ReturnCapMLP,
     ReturnCapper,
     compute_global_expectile,
+    train_return_cap,
 )
 from udt.intervention import ReturnBudget
+
 
 
 def test_expectile_loss_symmetric_tau_half():
@@ -145,4 +147,74 @@ def test_return_capper_handles_horizon_boundary():
     token_beyond_h = capper.step(budget, state, step=150)
     assert not np.isnan(token_at_h)
     assert not np.isnan(token_beyond_h)
+
+
+def test_train_return_cap_synthetic_dataset():
+    # Build a synthetic dataset with 10 episodes of 20 steps each
+    rng = np.random.default_rng(42)
+    state_dim = 4
+    num_episodes = 20
+    ep_len = 25
+    horizon = 25
+
+    obs_list, rtg_list, t_list, ep_id_list = [], [], [], []
+    for ep in range(num_episodes):
+        # States drift slightly with step
+        for t in range(ep_len):
+            s = rng.normal(loc=float(t) / 10.0, scale=0.5, size=state_dim)
+            # Remaining return roughly (ep_len - t) with positive reward
+            r_remaining = (ep_len - t) * 0.1 + rng.normal(0, 0.05)
+            obs_list.append(s)
+            rtg_list.append(r_remaining)
+            t_list.append(t)
+            ep_id_list.append(ep)
+
+    dataset = {
+        "observations": np.array(obs_list, dtype=np.float32),
+        "returns_to_go": np.array(rtg_list, dtype=np.float32),
+        "timesteps": np.array(t_list, dtype=np.int64),
+        "episode_ids": np.array(ep_id_list, dtype=np.int64),
+        "is_validation": np.isin(ep_id_list, [0, 1, 2, 3]),
+    }
+
+    capper, metrics = train_return_cap(
+        dataset=dataset,
+        horizon=horizon,
+        tau=0.9,
+        mode="state_time",
+        epochs=15,
+        lr=5e-3,
+        batch_size=64,
+        device="cpu",
+    )
+
+    assert isinstance(capper, ReturnCapper)
+    assert "val_loss" in metrics
+    assert len(metrics["val_loss"]) > 0
+    # Val loss should decrease from epoch 0 to final
+    assert metrics["val_loss"][-1] < metrics["val_loss"][0]
+    # Check coverage on validation
+    final_coverage = metrics["val_coverage"][-1]
+    assert final_coverage >= 0.7  # Expectile tau=0.9 targets high percentile coverage
+
+
+def test_train_return_cap_global_baseline():
+    dataset = {
+        "observations": np.zeros((100, 4)),
+        "returns_to_go": np.linspace(0.0, 10.0, 100),
+        "timesteps": np.zeros(100, dtype=np.int64),
+        "episode_ids": np.zeros(100, dtype=np.int64),
+        "is_validation": np.array([False] * 80 + [True] * 20),
+    }
+    capper, metrics = train_return_cap(
+        dataset=dataset,
+        horizon=100,
+        tau=0.9,
+        mode="global",
+    )
+    assert isinstance(capper, ReturnCapper)
+    assert isinstance(capper.model, GlobalReturnCap)
+    assert "cap_value" in metrics
+    assert np.isclose(capper.get_cap(np.zeros(4), step=0), metrics["cap_value"])
+
 
