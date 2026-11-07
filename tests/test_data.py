@@ -1,7 +1,8 @@
+import h5py
 import numpy as np
 import pytest
 
-from udt.data import audit_dataset, prepare_dataset
+from udt.data import audit_dataset, load_dataset, prepare_dataset
 
 
 def transitions():
@@ -68,3 +69,39 @@ def test_corrupt_values_fail_before_label_generation(field, value):
 def test_data_without_two_complete_episodes_cannot_be_split():
     with pytest.raises(ValueError, match='two verified episodes'):
         prepare_dataset(transitions(), horizon=2)
+
+
+def test_load_dataset_npz(tmp_path):
+    d = transitions()
+    npz_path = tmp_path / "test.npz"
+    np.savez(npz_path, **d)
+
+    loaded = load_dataset(npz_path)
+    for k in d:
+        np.testing.assert_array_equal(loaded[k], d[k])
+
+
+def test_load_dataset_hdf5(tmp_path):
+    d = transitions()
+    h5_path = tmp_path / "test.hdf5"
+    with h5py.File(h5_path, "w") as f:
+        for k, v in d.items():
+            f.create_dataset(k, data=v)
+
+    loaded = load_dataset(h5_path)
+    for k in d:
+        np.testing.assert_array_equal(loaded[k], d[k])
+
+
+def test_load_dataset_rejects_pickle(tmp_path):
+    pkl_path = tmp_path / "dataset.pkl"
+    pkl_path.write_bytes(b"dummy pickle content")
+
+    with pytest.raises(ValueError, match="NPZ or HDF5"):
+        load_dataset(pkl_path)
+
+
+def test_load_dataset_missing_file(tmp_path):
+    missing_path = tmp_path / "non_existent.hdf5"
+    with pytest.raises(FileNotFoundError):
+        load_dataset(missing_path)

@@ -5,8 +5,10 @@ Unknown starts, collection cuts and discontinuities never become complete episod
 """
 
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 
 
@@ -43,6 +45,51 @@ def validate_dataset(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             raise ValueError(f'{key}: flags must be 0 or 1')
         arrays[key] = arrays[key].astype(bool)
     return arrays
+
+
+def load_dataset(path: str | Path) -> dict[str, np.ndarray]:
+    """Load a dataset from an HDF5 or NPZ file safely without pickle.
+
+    Args:
+        path: Path to .hdf5, .h5, or .npz file.
+
+    Returns:
+        Dictionary mapping field names to NumPy arrays.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If file is a pickle or an unsupported format.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Dataset file not found: {p}")
+
+    suffix = p.suffix.lower()
+    if suffix == ".pkl":
+        raise ValueError("Pickle format (.pkl) is not supported; use NPZ or HDF5.")
+
+    data: dict[str, np.ndarray] = {}
+    if suffix in (".hdf5", ".h5"):
+        with h5py.File(p, "r") as f:
+            for key in f.keys():
+                data[key] = np.asarray(f[key])
+    elif suffix == ".npz":
+        with np.load(p, allow_pickle=False) as npz:
+            for key in npz.files:
+                data[key] = np.asarray(npz[key])
+    else:
+        raise ValueError(f"Unsupported dataset format: {suffix}. Expected .hdf5, .h5, or .npz")
+
+    # If next_observations is missing but observations is present, construct via shift
+    if "next_observations" not in data and "observations" in data and len(data["observations"]) > 0:
+        obs = data["observations"]
+        data["next_observations"] = np.vstack([obs[1:], obs[-1:]])
+
+    # If timeouts is missing, initialize as zeros
+    if "timeouts" not in data and "rewards" in data:
+        data["timeouts"] = np.zeros(len(data["rewards"]), dtype=bool)
+
+    return data
 
 
 def audit_dataset(data: dict[str, np.ndarray], *, horizon: int,
