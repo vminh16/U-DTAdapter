@@ -50,7 +50,16 @@ class ExpectileLoss(nn.Module):
         Returns:
             Computed loss according to the specified reduction.
         """
+        if input.shape != target.shape:
+            if input.ndim == target.ndim + 1 and input.shape[-1] == 1:
+                target = target.unsqueeze(-1)
+            elif target.ndim == input.ndim + 1 and target.shape[-1] == 1:
+                target = target.squeeze(-1)
+            else:
+                raise ValueError(f"Shape mismatch in ExpectileLoss: input {input.shape} vs target {target.shape}")
+
         diff = target - input
+
         # Indicator is 1 when target < input (over-estimation), 0 otherwise
         weight = torch.abs(self.tau - (diff < 0.0).float())
         loss = weight * (diff ** 2)
@@ -180,7 +189,10 @@ class ReturnCapMLP(nn.Module):
                 t = t.view(1, 1)
             elif t.ndim == 1:
                 t = t.unsqueeze(-1)
+            if s.shape[0] > 1 and t.shape[0] == 1:
+                t = t.expand(s.shape[0], -1)
             x = torch.cat([s, t], dim=-1)
+
 
         elif self.mode == "time_only":
             if t_rel is None:
@@ -221,6 +233,8 @@ class ReturnCapper:
         state_std: np.ndarray | None = None,
         device: str = "cpu",
     ):
+        if horizon <= 0:
+            raise ValueError(f"horizon must be positive, got {horizon}")
         self.model = model
         self.horizon = int(horizon)
         self.margin = float(margin)
@@ -249,8 +263,13 @@ class ReturnCapper:
         if isinstance(self.model, GlobalReturnCap):
             return self.model.get_cap(state, step, self.horizon)
 
+        # Safely convert observation to numpy float32 regardless of torch device/grad status
+        if isinstance(state, torch.Tensor):
+            s_arr = state.detach().cpu().numpy().astype(np.float32)
+        else:
+            s_arr = np.asarray(state, dtype=np.float32)
+
         # Normalize observation if statistics are registered
-        s_arr = np.asarray(state, dtype=np.float32)
         if self.state_mean is not None and self.state_std is not None:
             s_arr = (s_arr - self.state_mean) / self.state_std
 
@@ -262,6 +281,7 @@ class ReturnCapper:
             t_tensor = torch.tensor([[t_rel]], device=self.device, dtype=torch.float32)
             out = self.model(s_tensor, t_tensor)
             return float(out.item())
+
 
     def step(self, budget: ReturnBudget, state: np.ndarray | torch.Tensor, step: int) -> float:
         """Compute cap and return the clipped token for DT input.

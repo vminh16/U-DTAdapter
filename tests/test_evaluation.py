@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from udt.return_cap import GlobalReturnCap, ReturnCapper
+from udt.return_cap import GlobalReturnCap, ReturnCapMLP, ReturnCapper
+
 from udt.evaluation import evaluate_with_budget, RolloutResult
 
 
@@ -55,9 +56,9 @@ def test_evaluate_with_budget_unclipped_baseline_b0():
 
 
 
-def test_evaluate_with_budget_inflated_target_clipped_b3():
+def test_evaluate_with_budget_inflated_target_clipped_b2_global():
     env = MockEnvironment(step_reward=10.0, max_steps=20)
-    # Cap set to 1.0 (equivalent to 1000.0 unscaled return)
+    # Baseline B2: Global scalar cap set to 1.0 (equivalent to 1000.0 unscaled return)
     capper = ReturnCapper(
         model=GlobalReturnCap(cap_value=1.0),
         horizon=20,
@@ -82,4 +83,41 @@ def test_evaluate_with_budget_inflated_target_clipped_b3():
     # Raw budget must NOT be crushed; it starts at 5.0 and ends at 4.8
     assert np.isclose(result.raw_budgets[0], 5.0)
     assert np.isclose(result.final_raw_budget, 4.8)
+
+
+def test_evaluate_with_budget_neural_mlp_b3():
+    env = MockEnvironment(step_reward=5.0, max_steps=10)
+    # Baseline B3: State-time neural model
+    mlp = ReturnCapMLP(state_dim=4, hidden_dim=32, num_layers=2, mode="state_time")
+    # Set weights so output is roughly 0.5
+    for p in mlp.parameters():
+        p.data.zero_()
+    # Bias of final layer = 0.5
+    list(mlp.parameters())[-1].data.fill_(0.5)
+
+    capper = ReturnCapper(
+        model=mlp,
+        horizon=10,
+        margin=0.1,  # effective cap = 0.6
+        scale=1000.0,
+    )
+
+    result = evaluate_with_budget(
+        env=env,
+        policy_fn=mock_policy,
+        capper=capper,
+        initial_target=2000.0,  # raw = 2.0
+        horizon=10,
+        reward_scale=1000.0,
+    )
+
+    assert isinstance(result, RolloutResult)
+    assert result.length == 10
+    assert result.clipping_frequency == 1.0
+    # Every token should be capped at 0.5 + 0.1 = 0.6
+    assert np.allclose(result.tokens_used, 0.6)
+    # Raw budget starts at 2.0 and ends at 2.0 - (10 * 5) / 1000 = 1.95
+    assert np.isclose(result.raw_budgets[0], 2.0)
+    assert np.isclose(result.final_raw_budget, 1.95)
+
 

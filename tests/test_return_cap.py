@@ -88,7 +88,15 @@ def test_return_cap_mlp_forward_shapes():
     out_st_single = mlp_st(states[0], t_rel[0])
     assert out_st_single.shape == (1, 1)
 
+    # Batched states with scalar float or 0D tensor timestep (crucial for candidate evaluation)
+    out_st_scalar_t = mlp_st(states, 0.5)
+    assert out_st_scalar_t.shape == (batch_size, 1)
+
+    out_st_0d_tensor_t = mlp_st(states, torch.tensor(0.5))
+    assert out_st_0d_tensor_t.shape == (batch_size, 1)
+
     # Mode: time_only (Baseline B9)
+
     mlp_to = ReturnCapMLP(state_dim=state_dim, hidden_dim=64, num_layers=2, mode="time_only")
     out_to = mlp_to(None, t_rel)
     assert out_to.shape == (batch_size, 1)
@@ -198,7 +206,28 @@ def test_train_return_cap_synthetic_dataset():
     assert final_coverage >= 0.7  # Expectile tau=0.9 targets high percentile coverage
 
 
-def test_train_return_cap_global_baseline():
+def test_return_capper_accepts_tensor_with_grad():
+    mlp = ReturnCapMLP(state_dim=4, hidden_dim=32, num_layers=2, mode="state_time")
+    capper = ReturnCapper(model=mlp, horizon=100)
+    # PyTorch tensor with gradient
+    state_tensor = torch.randn(4, requires_grad=True)
+    cap = capper.get_cap(state_tensor, step=10)
+    assert np.isfinite(cap)
+
+
+def test_return_capper_rejects_non_positive_horizon():
+    mlp = ReturnCapMLP(state_dim=4, hidden_dim=32, num_layers=2, mode="state_time")
+    with pytest.raises(ValueError, match="horizon must be positive"):
+        ReturnCapper(model=mlp, horizon=0)
+    with pytest.raises(ValueError, match="horizon must be positive"):
+        ReturnCapper(model=mlp, horizon=-10)
+
+
+def test_expectile_loss_shape_mismatch():
+    loss_fn = ExpectileLoss()
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        loss_fn(torch.zeros(10, 2), torch.zeros(10, 5))
+
     dataset = {
         "observations": np.zeros((100, 4)),
         "returns_to_go": np.linspace(0.0, 10.0, 100),

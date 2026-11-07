@@ -83,12 +83,13 @@ def evaluate_with_budget(
 
         if capper is not None:
             cap_val = capper.get_cap(obs, step)
-            token = capper.step(budget, obs, step)
+            token = budget.token(cap=cap_val, margin=capper.margin)
             was_clipped = raw_budget_at_t > (cap_val + capper.margin)
         else:
             cap_val = float("inf")
             token = budget.token(cap=None)
             was_clipped = False
+
 
         caps.append(cap_val)
         tokens_used.append(token)
