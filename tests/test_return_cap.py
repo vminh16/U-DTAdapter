@@ -10,6 +10,7 @@ from udt.return_cap import (
     ReturnCapper,
     compute_expectile_foc_residual,
     compute_global_expectile,
+    evaluate_return_capper,
     train_return_cap,
 )
 from udt.intervention import ReturnBudget
@@ -546,5 +547,35 @@ def test_training_input_validation():
     no_val = dict(valid_ds, is_validation=np.zeros(20, dtype=bool))
     with pytest.raises(ValueError, match="validation samples"):
         train_return_cap(no_val, horizon=100)
+
+
+def test_reported_best_metrics_match_restored_checkpoint():
+    rng = np.random.default_rng(3)
+    n = 120
+    obs = rng.normal(size=(n, 3)).astype(np.float32)
+    timesteps = np.tile(np.arange(10), 12).astype(np.int64)
+    returns = (obs[:, 0] * 0.3 + rng.normal(scale=0.05, size=n)).astype(np.float32)
+    dataset = {
+        "observations": obs,
+        "returns_to_go": returns,
+        "timesteps": timesteps,
+        "is_validation": np.repeat([False, True], n // 2),
+    }
+
+    capper, metrics = train_return_cap(
+        dataset, horizon=10, mode="state_time", tau=0.9,
+        epochs=6, patience=10, batch_size=16, seed=5,
+    )
+    independent = evaluate_return_capper(
+        dataset, capper, horizon=10, tau=0.9, split="validation"
+    )
+    assert np.isclose(metrics["best_val_loss"], independent["loss"])
+    assert np.isclose(metrics["best_val_coverage"], independent["coverage"])
+    assert metrics["best_val_coverage"] == metrics["val_coverage"][metrics["best_epoch"]]
+
+    # Global-cap branch also reports best (single) metrics explicitly.
+    _, global_metrics = train_return_cap(dataset, horizon=10, mode="global", tau=0.9)
+    assert "best_val_coverage" in global_metrics
+    assert global_metrics["best_val_loss"] == global_metrics["val_loss"][-1]
 
 

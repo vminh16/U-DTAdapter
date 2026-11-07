@@ -12,6 +12,9 @@ def make_dummy_hdf5_bytes():
     bio = io.BytesIO()
     with h5py.File(bio, "w") as f:
         f.create_dataset("observations", data=np.zeros((10, 4)))
+        f.create_dataset("actions", data=np.zeros((10, 2)))
+        f.create_dataset("rewards", data=np.zeros(10))
+        f.create_dataset("terminals", data=np.zeros(10))
     return bio.getvalue()
 
 
@@ -156,6 +159,69 @@ def test_download_dataset_sha256_verification(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp):
         out = download_dataset("hopper-medium-v2", target_dir=tmp_path, expected_sha256=expected_hash)
         assert out.exists()
+
+
+def test_format_valid_hdf5_without_required_fields_is_rejected(tmp_path):
+    bio = io.BytesIO()
+    with h5py.File(bio, "w") as f:
+        f.create_dataset("observations", data=np.zeros((5, 3)))
+    payload = bio.getvalue()
+
+    mock_resp = MagicMock()
+    mock_resp.read.side_effect = [payload, b""]
+    mock_resp.headers.get.return_value = str(len(payload))
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(OSError, match="not a valid dataset"):
+            download_dataset("hopper-medium-v2", target_dir=tmp_path)
+
+    assert not (tmp_path / "hopper_medium-v2.hdf5").exists()
+    assert not (tmp_path / "hopper_medium-v2.hdf5.tmp").exists()
+
+
+def test_cached_schema_invalid_file_triggers_redownload(tmp_path):
+    dest = tmp_path / "hopper_medium-v2.hdf5"
+    bio = io.BytesIO()
+    with h5py.File(bio, "w") as f:
+        f.create_dataset("observations", data=np.zeros((5, 3)))
+    dest.write_bytes(bio.getvalue())
+
+    content = make_dummy_hdf5_bytes()
+    mock_resp = MagicMock()
+    mock_resp.read.side_effect = [content, b""]
+    mock_resp.headers.get.return_value = str(len(content))
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        out = download_dataset("hopper-medium-v2", target_dir=tmp_path)
+        assert out.read_bytes() == content
+        mock_urlopen.assert_called_once()
+
+
+def test_download_provenance_records_source_hash(tmp_path):
+    content = make_dummy_hdf5_bytes()
+    mock_resp = MagicMock()
+    mock_resp.read.side_effect = [content, b""]
+    mock_resp.headers.get.return_value = str(len(content))
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = None
+
+    provenance = tmp_path / "provenance.json"
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        download_dataset(
+            "hopper-medium-v2", target_dir=tmp_path, provenance_path=provenance
+        )
+
+    import json
+    payload = json.loads(provenance.read_text())
+    import hashlib
+    assert payload["source_sha256"] == hashlib.sha256(content).hexdigest()
+    assert payload["dataset_info"]["transitions"] == 10
+    assert payload["dataset_info"]["state_dim"] == 4
+    assert payload["checksum_source"] == "computed_sha256"
 
 
 def test_download_dataset_corrupted_cached_file_triggers_redownload(tmp_path):

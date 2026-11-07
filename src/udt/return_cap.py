@@ -298,6 +298,65 @@ class ReturnCapper:
             return float(out.item())
 
 
+    def get_cap_batch(
+        self,
+        states: np.ndarray | torch.Tensor,
+        step: int | np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate the return model on a batch of raw observations.
+
+        Args:
+            states: Raw observation array of shape (K, state_dim).
+            step: Timestep shared by every state in the batch, or an integer
+                array of shape (K,) with one timestep per state.
+
+        Returns:
+            Scaled return predictions of shape (K,).
+        """
+        if isinstance(self.model, GlobalReturnCap):
+            batch = np.asarray(states)
+            if batch.ndim != 2 or batch.shape[0] < 1 or batch.shape[1] < 1:
+                raise ValueError(f"states must have shape (K, state_dim), got {batch.shape}")
+            return np.full(batch.shape[0], self.model.cap_value, dtype=np.float32)
+
+        if isinstance(states, torch.Tensor):
+            s_arr = states.detach().cpu().numpy().astype(np.float32)
+        else:
+            s_arr = np.asarray(states, dtype=np.float32)
+        if s_arr.ndim != 2 or s_arr.shape[0] < 1 or s_arr.shape[1] < 1:
+            raise ValueError(f"states must have shape (K, state_dim), got {s_arr.shape}")
+        if not np.isfinite(s_arr).all():
+            raise ValueError("states contains non-finite values")
+        if self.state_mean is not None and self.state_std is not None:
+            if s_arr.shape[1] != self.state_mean.shape[0]:
+                raise ValueError(
+                    f"state dimension {s_arr.shape[1]} does not match return-model "
+                    f"normalization dimension {self.state_mean.shape[0]}"
+                )
+            s_arr = (s_arr - self.state_mean) / self.state_std
+
+        steps = np.asarray(step)
+        if steps.ndim == 0:
+            t_rel = np.full(
+                s_arr.shape[0], min(1.0, max(0.0, float(steps) / float(self.horizon))),
+                dtype=np.float32,
+            )
+        else:
+            if steps.shape != (s_arr.shape[0],):
+                raise ValueError(
+                    f"step array must have shape ({s_arr.shape[0]},), got {steps.shape}"
+                )
+            if not np.isfinite(steps).all():
+                raise ValueError("step array contains non-finite values")
+            t_rel = np.clip(steps.astype(np.float32) / float(self.horizon), 0.0, 1.0)
+        with torch.no_grad():
+            s_tensor = torch.as_tensor(s_arr, device=self.device, dtype=torch.float32)
+            t_tensor = torch.as_tensor(
+                t_rel[:, None], device=self.device, dtype=torch.float32
+            )
+            out = self.model(s_tensor, t_tensor)
+            return out.detach().cpu().numpy().astype(np.float32).reshape(-1)
+
     def step(self, budget: ReturnBudget, state: np.ndarray | torch.Tensor, step: int) -> float:
         """Compute cap and return the clipped token for DT input.
 
@@ -320,6 +379,61 @@ class ReturnCapper:
             )
         cap = self.get_cap(state, step)
         return budget.token(cap=cap, margin=self.margin)
+
+
+def evaluate_return_capper(
+    dataset: dict[str, np.ndarray],
+    capper: ReturnCapper,
+    *,
+    horizon: int,
+    margin: float = 0.0,
+    tau: float = 0.9,
+    split: str = "validation",
+    batch_size: int = 8192,
+) -> dict[str, float]:
+    """Independently evaluate a restored capper on one dataset split.
+
+    This uses the same preprocessing stored with the capper, so it can detect a
+    mismatch between best-checkpoint telemetry and the returned model.
+    """
+    for key in ("observations", "returns_to_go", "timesteps", "is_validation"):
+        if key not in dataset:
+            raise ValueError(f"Dataset missing required key: {key}")
+    if capper.horizon != int(horizon):
+        raise ValueError(
+            f"Capper horizon ({capper.horizon}) does not match evaluation horizon ({horizon})"
+        )
+    is_val = np.asarray(dataset["is_validation"])
+    if not np.issubdtype(is_val.dtype, np.bool_):
+        raise ValueError("is_validation must be boolean")
+    if split == "validation":
+        mask = is_val
+    elif split == "train":
+        mask = ~is_val
+    else:
+        raise ValueError(f"split must be 'train' or 'validation', got {split}")
+    if not np.any(mask):
+        raise ValueError(f"Dataset split '{split}' is empty")
+
+    obs = np.asarray(dataset["observations"])[mask]
+    returns = np.asarray(dataset["returns_to_go"])[mask].astype(np.float64)
+    timesteps = np.asarray(dataset["timesteps"])[mask]
+    n = len(obs)
+    loss_sum = 0.0
+    covered = 0
+    for start in range(0, n, batch_size):
+        stop = min(n, start + batch_size)
+        preds = capper.get_cap_batch(obs[start:stop], timesteps[start:stop])
+        target = returns[start:stop] - margin
+        diff = target - preds
+        weights = np.where(diff < 0.0, 1.0 - tau, tau)
+        loss_sum += float(np.sum(weights * diff ** 2))
+        covered += int(np.sum(diff <= 0.0))
+    return {
+        "samples": int(n),
+        "loss": loss_sum / n,
+        "coverage": covered / n,
+    }
 
 
 def train_return_cap(
@@ -460,6 +574,7 @@ def train_return_cap(
             "val_loss": [val_loss],
             "val_coverage": [val_cov],
             "best_val_loss": val_loss,
+            "best_val_coverage": val_cov,
             "best_epoch": 0,
         }
         return capper, metrics
@@ -606,11 +721,20 @@ def train_return_cap(
         state_std=state_std,
         device=device,
     )
+
+    # Report metrics for the checkpoint actually restored, not the last epoch.
+    independent = evaluate_return_capper(
+        dataset, capper, horizon=horizon, margin=margin, tau=tau, split="validation"
+    )
+    best_val_loss = independent["loss"]
+    best_val_coverage = independent["coverage"]
     metrics = {
         "train_loss": train_loss_hist,
         "val_loss": val_loss_hist,
         "val_coverage": val_cov_hist,
         "best_val_loss": best_val_loss,
+        "best_val_coverage": best_val_coverage,
         "best_epoch": best_epoch,
+        "restored_checkpoint_evaluation": independent,
     }
     return capper, metrics

@@ -54,6 +54,15 @@ def test_cli_verify_u_command():
     assert "ALL MODULE U INVARIANTS VERIFIED!" in result.stdout
 
 
+def test_cli_readiness_reports_blockers_without_artifacts(tmp_path):
+    report_path = tmp_path / 'readiness.json'
+    result = invoke('readiness', '--json', '--output', report_path)
+    assert result.returncode == 1, result.stderr
+    report = json.loads(report_path.read_text())
+    assert report['ready'] is False
+    assert 'frozen_dt_parity' in report['blockers']
+
+
 def test_cli_train_u_roundtrip(tmp_path):
     source = tmp_path / 'demo.npz'
     assert invoke('demo-data', '--output', source).returncode == 0

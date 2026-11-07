@@ -6,6 +6,7 @@ legacy gym or d4rl package installations.
 
 from pathlib import Path
 import hashlib
+import json
 import urllib.request
 import h5py
 
@@ -26,6 +27,90 @@ D4RL_URLS: dict[str, str] = {
 }
 
 
+REQUIRED_DATASET_FIELDS = ("observations", "actions", "rewards", "terminals")
+
+
+def compute_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
+    """Compute the SHA-256 digest of a file."""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(chunk_size):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def validate_dataset_file(path: str | Path) -> dict:
+    """Validate required fields and basic shapes in an HDF5 dataset.
+
+    A syntactically valid HDF5 container is not automatically a D4RL dataset.
+    Optional fields (``next_observations``, ``timeouts``) are checked for
+    consistency when present but are not required here; their provenance is
+    handled by :mod:`udt.data`.
+    """
+    target = Path(path)
+    try:
+        with h5py.File(target, "r") as handle:
+            missing = [name for name in REQUIRED_DATASET_FIELDS if name not in handle]
+            if missing:
+                raise ValueError(f"Dataset missing required HDF5 fields: {missing}")
+            for name in REQUIRED_DATASET_FIELDS:
+                if not isinstance(handle[name], h5py.Dataset):
+                    raise ValueError(f"{name} must be an HDF5 dataset, not a group")
+
+            obs = handle["observations"]
+            actions = handle["actions"]
+            rewards = handle["rewards"]
+            terminals = handle["terminals"]
+            if obs.ndim != 2 or obs.shape[0] < 1 or obs.shape[1] < 1:
+                raise ValueError(f"observations must have shape (N, state_dim), got {obs.shape}")
+            n = obs.shape[0]
+            if actions.ndim != 2 or actions.shape[0] != n or actions.shape[1] < 1:
+                raise ValueError(
+                    f"actions must have shape ({n}, act_dim), got {actions.shape}"
+                )
+            if rewards.shape != (n,):
+                raise ValueError(f"rewards must have shape ({n},), got {rewards.shape}")
+            if terminals.shape != (n,):
+                raise ValueError(f"terminals must have shape ({n},), got {terminals.shape}")
+            observed_shape = obs.shape
+            for optional in ("next_observations", "timeouts"):
+                if optional in handle:
+                    dataset = handle[optional]
+                    if not isinstance(dataset, h5py.Dataset):
+                        raise ValueError(f"{optional} must be an HDF5 dataset, not a group")
+                    if optional == "next_observations" and dataset.shape != observed_shape:
+                        raise ValueError(
+                            f"next_observations must have shape {observed_shape}, "
+                            f"got {dataset.shape}"
+                        )
+                    if optional == "timeouts" and dataset.shape != (n,):
+                        raise ValueError(f"timeouts must have shape ({n},), got {dataset.shape}")
+            return {
+                "transitions": int(n),
+                "state_dim": int(obs.shape[1]),
+                "action_dim": int(actions.shape[1]),
+                "fields": sorted(handle.keys()),
+            }
+    except OSError as exc:
+        raise ValueError(f"Invalid HDF5 dataset {target}: {exc}") from exc
+
+
+def _write_provenance(path, name, url, dest_file, sha256, dataset_info, *, reason):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "dataset": name,
+        "url": url,
+        "path": str(dest_file),
+        "source_sha256": sha256,
+        "size_bytes": dest_file.stat().st_size,
+        "dataset_info": dataset_info,
+        "provenance_reason": reason,
+        "checksum_source": "computed_sha256",
+    }
+    target.write_text(json.dumps(payload, indent=2))
+
+
 def download_dataset(
     name: str,
     target_dir: str | Path = "data/raw",
@@ -33,6 +118,7 @@ def download_dataset(
     chunk_size: int = 1024 * 1024,
     timeout: float = 60.0,
     expected_sha256: str | None = None,
+    provenance_path: str | Path | None = None,
 ) -> Path:
     """Download an official D4RL dataset in raw HDF5 format.
 
@@ -63,16 +149,23 @@ def download_dataset(
     dest_file = target_path / filename
 
     if dest_file.exists() and not force and dest_file.stat().st_size > 0:
-        # Check if cache is uncorrupted
-        if h5py.is_hdf5(dest_file):
-            if expected_sha256 is not None:
-                h = hashlib.sha256()
-                with open(dest_file, "rb") as f:
-                    while chunk := f.read(chunk_size):
-                        h.update(chunk)
-                if h.hexdigest().lower() == expected_sha256.lower():
-                    return dest_file
-            else:
+        # A cached file is reusable only when it is HDF5 *and* has a valid
+        # dataset schema. A format-valid but empty/foreign HDF5 is not a dataset.
+        cache_valid = h5py.is_hdf5(dest_file)
+        cache_info: dict | None = None
+        if cache_valid:
+            try:
+                cache_info = validate_dataset_file(dest_file)
+            except ValueError:
+                cache_valid = False
+        if cache_valid:
+            cache_hash = compute_sha256(dest_file, chunk_size)
+            if expected_sha256 is None or cache_hash.lower() == expected_sha256.lower():
+                if provenance_path is not None:
+                    _write_provenance(
+                        provenance_path, name, url, dest_file, cache_hash, cache_info,
+                        reason="cache_hit",
+                    )
                 return dest_file
 
     tmp_file = dest_file.with_name(f"{filename}.tmp")
@@ -104,16 +197,25 @@ def download_dataset(
         if not h5py.is_hdf5(tmp_file):
             raise OSError(f"Downloaded file {tmp_file} is not a valid HDF5 file")
 
-        if expected_sha256 is not None:
-            actual_sha256 = hasher.hexdigest().lower()
-            if actual_sha256 != expected_sha256.lower():
-                raise OSError(
-                    f"SHA-256 mismatch for {name}: expected {expected_sha256}, got {actual_sha256}"
-                )
+        actual_sha256 = hasher.hexdigest().lower()
+        if expected_sha256 is not None and actual_sha256 != expected_sha256.lower():
+            raise OSError(
+                f"SHA-256 mismatch for {name}: expected {expected_sha256}, got {actual_sha256}"
+            )
+
+        try:
+            dataset_info = validate_dataset_file(tmp_file)
+        except ValueError as exc:
+            raise OSError(f"Downloaded HDF5 for {name} is not a valid dataset: {exc}") from exc
 
         # Atomic rename once verified
         tmp_file.replace(dest_file)
         completed_successfully = True
+        if provenance_path is not None:
+            _write_provenance(
+                provenance_path, name, url, dest_file, actual_sha256, dataset_info,
+                reason="downloaded",
+            )
         return dest_file
 
     finally:

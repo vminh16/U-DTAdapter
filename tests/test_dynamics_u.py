@@ -75,6 +75,8 @@ def test_train_dynamics_ensemble():
     terminals = np.zeros(n_total, dtype=bool)
     timesteps = np.zeros(n_total, dtype=np.int64)
     is_val = np.array([False] * n_train + [True] * n_val)
+    episode_ids = np.array([0] * 10 + [1] * 10 + [2] * 10 + [3] * 10
+                           + [10] * 10 + [11] * 10, dtype=np.int64)
 
     dataset = {
         "observations": obs,
@@ -83,6 +85,7 @@ def test_train_dynamics_ensemble():
         "rewards": rewards,
         "terminals": terminals,
         "timesteps": timesteps,
+        "episode_ids": episode_ids,
         "is_validation": is_val,
     }
 

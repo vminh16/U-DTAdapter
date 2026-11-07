@@ -1,13 +1,8 @@
-"""UDT module execution entrypoint forwarding to run.py."""
+"""Module execution entrypoint for ``python -m udt``."""
 
 import sys
-from pathlib import Path
 
-# Add project root to path
-ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(ROOT))
-
-import run
+from udt.cli import main
 
 if __name__ == "__main__":
-    sys.exit(run.main())
+    sys.exit(main())

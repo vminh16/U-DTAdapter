@@ -41,8 +41,33 @@ pip install -e . --no-deps
 ### 2. Run Tests
 
 ```bash
-pytest tests/test_data.py tests/test_intervention.py -v
+pytest -q
 ```
+
+### 3. CLI
+
+The package installs a single `udt` entrypoint:
+
+```bash
+udt --help
+udt download hopper-medium-v2 --target-dir data/raw
+udt prepare data/raw/hopper-medium-v2.hdf5 --horizon 1000 --output data/prepared/hopper-medium-v2
+udt train-r --data data/prepared/hopper-medium-v2/dataset.npz --horizon 1000 --mode state_time
+udt train-u --data data/prepared/hopper-medium-v2/dataset.npz --horizon 1000 --num-models 5
+udt readiness --manifest data/prepared/hopper-medium-v2/manifest.json \
+  --dataset data/prepared/hopper-medium-v2/dataset.npz \
+  --dynamics-checkpoint checkpoints/module_u/dynamics_ensemble.pt \
+  --return-checkpoint checkpoints/module_r/return_capper.pt \
+  --parity parity.json --json
+```
+
+`udt readiness` exits non-zero while any blocker remains (missing provenance,
+split leakage, missing real-DT parity, incomplete bootstrap/normalization
+metadata, unavailable R/U variants, or untraceable checkpoints). A real pilot
+is only reportable when that command returns `"ready": true` against a real
+frozen DT checkpoint. Latency is measured with `udt.profiling.measure_latency`
+/ `measure_controller_latency`, which report mean/p50/p95 plus hardware and
+software metadata.
 
 ## Research Documentation
 
