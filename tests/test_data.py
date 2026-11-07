@@ -100,6 +100,52 @@ def test_load_dataset_rejects_pickle(tmp_path):
     with pytest.raises(ValueError, match="NPZ or HDF5"):
         load_dataset(pkl_path)
 
+    pickle_path = tmp_path / "dataset.pickle"
+    pickle_path.write_bytes(b"dummy pickle content")
+
+    with pytest.raises(ValueError, match="NPZ or HDF5"):
+        load_dataset(pickle_path)
+
+
+def test_load_dataset_ignores_groups(tmp_path):
+    d = transitions()
+    h5_path = tmp_path / "groups_test.hdf5"
+    with h5py.File(h5_path, "w") as f:
+        for k, v in d.items():
+            f.create_dataset(k, data=v)
+        # Create an HDF5 group (like 'infos' or 'metadata' in D4RL)
+        group = f.create_group("infos")
+        group.create_dataset("qpos", data=np.ones((5, 2)))
+
+    loaded = load_dataset(h5_path)
+    # Group should not be loaded as a string array or corrupt top-level keys
+    assert "infos" not in loaded
+    for k in d:
+        np.testing.assert_array_equal(loaded[k], d[k])
+
+
+def test_load_dataset_infers_missing_next_observations_and_timeouts(tmp_path):
+    # Dataset missing next_observations and timeouts
+    raw_data = {
+        "observations": np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        "actions": np.zeros((3, 1)),
+        "rewards": np.array([1.0, 2.0, 3.0]),
+        "terminals": np.array([0, 0, 1]),
+    }
+    npz_path = tmp_path / "missing_fields.npz"
+    np.savez(npz_path, **raw_data)
+
+    loaded = load_dataset(npz_path)
+    assert "next_observations" in loaded
+    # Shifted: [row 1, row 2, row 2]
+    expected_next = np.array([[3.0, 4.0], [5.0, 6.0], [5.0, 6.0]])
+    np.testing.assert_array_equal(loaded["next_observations"], expected_next)
+
+    assert "timeouts" in loaded
+    assert loaded["timeouts"].dtype == bool
+    assert len(loaded["timeouts"]) == 3
+    assert not np.any(loaded["timeouts"])
+
 
 def test_load_dataset_missing_file(tmp_path):
     missing_path = tmp_path / "non_existent.hdf5"

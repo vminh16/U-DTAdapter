@@ -65,14 +65,16 @@ def load_dataset(path: str | Path) -> dict[str, np.ndarray]:
         raise FileNotFoundError(f"Dataset file not found: {p}")
 
     suffix = p.suffix.lower()
-    if suffix == ".pkl":
-        raise ValueError("Pickle format (.pkl) is not supported; use NPZ or HDF5.")
+    if suffix in (".pkl", ".pickle"):
+        raise ValueError("Pickle format (.pkl/.pickle) is not supported; use NPZ or HDF5.")
 
     data: dict[str, np.ndarray] = {}
     if suffix in (".hdf5", ".h5"):
         with h5py.File(p, "r") as f:
             for key in f.keys():
-                data[key] = np.asarray(f[key])
+                # Only extract datasets, ignoring sub-groups such as 'infos' and 'metadata'
+                if isinstance(f[key], h5py.Dataset):
+                    data[key] = np.asarray(f[key])
     elif suffix == ".npz":
         with np.load(p, allow_pickle=False) as npz:
             for key in npz.files:
