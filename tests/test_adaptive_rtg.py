@@ -105,6 +105,168 @@ def _build_test_rig(seed: int = 42, horizon: int = 5):
 class TestMathematicalInvariants:
     """Verify B_t^{DT} = B_t^{raw} - alpha * max(0, B_t^{raw} - C_t) invariants."""
 
+    def test_numerical_counterexamples_failing_cases(self):
+        """Documented counterexamples where naive implementation fails IEEE-754 correctness."""
+        # Counterexample 1: raw=1e16, ceiling=1.0, alpha=1.0
+        # Naive implementation gives 0.0 because 1e16 - 1.0 == 1e16 in float64,
+        # so raw - 1.0 * (raw - ceiling) == 1e16 - 1e16 == 0.0.
+        # Exact mathematical and legacy hard cap is min(1e16, 1.0) == 1.0.
+        b1 = ReturnBudget(raw=1e16, reward_scale=1000.0)
+        assert b1.token(cap=1.0, margin=0.0, alpha=1.0) == 1.0
+
+        # Counterexample 2: raw=1e308, ceiling=-1e308, alpha=0.0
+        # Naive implementation produces inf for (raw - ceiling), then 0.0 * inf == nan,
+        # yielding nan instead of raw (1e308).
+        b2 = ReturnBudget(raw=1e308, reward_scale=1000.0)
+        assert b2.token(cap=-1e308, margin=0.0, alpha=0.0) == 1e308
+
+        # Counterexample 3: raw=1e308, ceiling=-1e308, alpha=0.5
+        # Naive implementation produces raw - 0.5 * inf == -inf instead of midpoint 0.0.
+        b3 = ReturnBudget(raw=1e308, reward_scale=1000.0)
+        assert b3.token(cap=-1e308, margin=0.0, alpha=0.5) == 0.0
+
+    def test_exact_endpoint_parity_comprehensive(self):
+        """Exhaustive exact equality tests for alpha=0 == raw and alpha=1 == min(raw, cap+margin)."""
+        test_cases = [
+            # (raw, cap, margin)
+            (5.0, 2.0, 0.0),
+            (5.0, 2.0, 1.5),
+            (2.0, 5.0, 0.0),
+            (3.0, 3.0, 0.0),
+            (-3.0, -5.0, 0.0),
+            (-5.0, -3.0, 0.0),
+            (-3.0, 5.0, 1.0),
+            (5.0, -3.0, 0.5),
+            (1e16, 1.0, 0.0),
+            (1e16, -1e16, 0.0),
+            (1e308, -1e308, 0.0),
+            (1e308, 1e308, 0.0),
+            (-1e308, 1e308, 0.0),
+            (1e-15, 1e-15, 1e-15),
+            (1.0000000000000002, 1.0, 0.0),
+            (1.0, 1.0000000000000002, 0.0),
+            # Overflowing cap + margin
+            (1e10, 1e308, 1e308),
+        ]
+        for raw, cap, margin in test_cases:
+            budget = ReturnBudget(raw=raw, reward_scale=1000.0)
+            expected_alpha0 = raw
+            expected_alpha1 = min(raw, cap + margin)
+
+            tok0 = budget.token(cap=cap, margin=margin, alpha=0.0)
+            tok1 = budget.token(cap=cap, margin=margin, alpha=1.0)
+
+            # Exact equality without allclose masking
+            assert tok0 == expected_alpha0, f"alpha=0 failed for raw={raw}, cap={cap}, margin={margin}: got {tok0}"
+            assert tok1 == expected_alpha1, f"alpha=1 failed for raw={raw}, cap={cap}, margin={margin}: got {tok1}"
+
+    def test_interior_alpha_boundedness_and_monotonicity(self):
+        """Verify min(raw, C) <= token <= raw and token nonincreasing on grid [0, .25, .5, .75, 1]."""
+        test_cases = [
+            (10.0, 2.0, 0.5),
+            (2.0, 10.0, 0.0),
+            (4.0, 4.0, 0.0),
+            (-2.0, -8.0, 1.0),
+            (1e16, 1.0, 0.0),
+            (1e308, -1e308, 0.0),
+            (1e-5, 1e-6, 0.0),
+        ]
+        grid = [0.0, 0.25, 0.5, 0.75, 1.0]
+        for raw, cap, margin in test_cases:
+            budget = ReturnBudget(raw=raw, reward_scale=1000.0)
+            ceiling = cap + margin
+            lower_bound = min(raw, ceiling)
+            upper_bound = raw
+
+            tokens = []
+            for alpha in grid:
+                tok = budget.token(cap=cap, margin=margin, alpha=alpha)
+                assert np.isfinite(tok), f"Token non-finite for raw={raw}, cap={cap}, alpha={alpha}"
+                assert lower_bound <= tok <= upper_bound, (
+                    f"Boundedness violated for raw={raw}, ceiling={ceiling}, alpha={alpha}: "
+                    f"expected in [{lower_bound}, {upper_bound}], got {tok}"
+                )
+                tokens.append(tok)
+
+            # Monotonicity test: token(alpha) nonincreasing as alpha increases
+            for i in range(len(tokens) - 1):
+                assert tokens[i] >= tokens[i + 1], (
+                    f"Monotonicity violated for raw={raw}, ceiling={ceiling}: "
+                    f"alpha={grid[i]} (tok={tokens[i]}) < alpha={grid[i+1]} (tok={tokens[i+1]})"
+                )
+
+    def test_cap_plus_margin_overflow_consistency(self):
+        """When cap + margin overflows to +inf, behavior must be consistent with min(raw, inf) == raw."""
+        raw = 500.0
+        budget = ReturnBudget(raw=raw, reward_scale=1000.0)
+        # cap + margin overflows float64
+        tok_alpha1 = budget.token(cap=1e308, margin=1e308, alpha=1.0)
+        assert tok_alpha1 == raw
+        tok_alpha_half = budget.token(cap=1e308, margin=1e308, alpha=0.5)
+        assert tok_alpha_half == raw
+        tok_alpha0 = budget.token(cap=1e308, margin=1e308, alpha=0.0)
+        assert tok_alpha0 == raw
+
+    def test_randomized_properties_fixed_seed(self):
+        """Randomized stress test with fixed seed verifying boundedness, monotonicity, finiteness."""
+        rng = np.random.default_rng(2026)
+        grid = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+        for _ in range(200):
+            # Sample across wide ranges of magnitudes, both positive and negative
+            raw_scale = 10.0 ** rng.uniform(-10, 100)
+            cap_scale = 10.0 ** rng.uniform(-10, 100)
+            raw = float(rng.choice([-1.0, 1.0]) * raw_scale)
+            cap = float(rng.choice([-1.0, 1.0]) * cap_scale)
+            margin = float(rng.uniform(0.0, 10.0))
+
+            budget = ReturnBudget(raw=raw, reward_scale=1000.0)
+            ceiling = cap + margin
+            lower_bound = min(raw, ceiling)
+            upper_bound = raw
+
+            tokens = []
+            for alpha in grid:
+                tok = budget.token(cap=cap, margin=margin, alpha=alpha)
+                assert np.isfinite(tok), f"Failed finiteness for raw={raw}, cap={cap}, alpha={alpha}"
+                assert lower_bound <= tok <= upper_bound, (
+                    f"Boundedness violated for raw={raw}, cap={cap}, margin={margin}, alpha={alpha}: "
+                    f"tok={tok} not in [{lower_bound}, {upper_bound}]"
+                )
+                tokens.append(tok)
+
+            # Monotonicity check
+            for i in range(len(tokens) - 1):
+                assert tokens[i] >= tokens[i + 1], (
+                    f"Monotonicity violated: alpha {grid[i]} (tok={tokens[i]}) < "
+                    f"alpha {grid[i+1]} (tok={tokens[i+1]})"
+                )
+
+    def test_invalid_inputs_rejected(self):
+        """Verify proper rejection of NaN/Inf and out-of-range values."""
+        # Non-finite raw in ReturnBudget
+        with pytest.raises(ValueError, match="Budget must be finite"):
+            ReturnBudget(raw=float("nan"))
+        with pytest.raises(ValueError, match="Budget must be finite"):
+            ReturnBudget(raw=float("inf"))
+
+        budget = ReturnBudget(raw=10.0, reward_scale=1000.0)
+        # Non-finite cap
+        with pytest.raises(ValueError, match="Cap must be finite and margin nonnegative"):
+            budget.token(cap=float("nan"))
+        with pytest.raises(ValueError, match="Cap must be finite and margin nonnegative"):
+            budget.token(cap=float("inf"))
+        with pytest.raises(ValueError, match="Cap must be finite and margin nonnegative"):
+            budget.token(cap=float("-inf"))
+
+        # Negative or non-finite margin
+        with pytest.raises(ValueError, match="Cap must be finite and margin nonnegative"):
+            budget.token(cap=5.0, margin=-1.0)
+        with pytest.raises(ValueError, match="Cap must be finite and margin nonnegative"):
+            budget.token(cap=5.0, margin=float("nan"))
+        with pytest.raises(ValueError, match="Cap must be finite and margin nonnegative"):
+            budget.token(cap=5.0, margin=float("inf"))
+
     def test_alpha_zero_returns_raw_budget(self):
         """alpha=0 must return raw budget regardless of cap value."""
         budget = ReturnBudget(raw=5.0, reward_scale=1000.0)

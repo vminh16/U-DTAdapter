@@ -25,10 +25,15 @@ class ReturnBudget:
             raise ValueError('Cap must be finite and margin nonnegative')
         if not np.isfinite(alpha) or alpha < 0 or alpha > 1:
             raise ValueError('alpha must be finite and in [0, 1]')
-        if cap is None:
-            return self.raw
+        if cap is None or alpha == 0.0:
+            return float(self.raw)
         ceiling = cap + margin
-        return self.raw - alpha * max(0.0, self.raw - ceiling)
+        if alpha == 1.0:
+            return float(min(self.raw, ceiling))
+        if self.raw <= ceiling:
+            return float(self.raw)
+        tok = (1.0 - alpha) * self.raw + alpha * ceiling
+        return float(min(self.raw, max(ceiling, tok)))
 
     def observe_reward(self, reward: float) -> None:
         if not np.isfinite(reward):
