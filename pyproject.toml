@@ -16,7 +16,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = [
+    "pytest>=7",
+    'tomli>=1.1.0; python_version < "3.11"',
+]
 baseline-dt = [
     "transformers>=4.5,<4.19",
 ]

@@ -71,8 +71,8 @@ def main() -> None:
     print(f"\n[DONE] Finished in {elapsed:.1f}s.")
     print(f"Train trajectories: {summary['num_train_trajectories']}")
     print(f"Val trajectories:   {summary['num_val_trajectories']}")
-    if summary["best_val_loss"] < float("inf"):
-        print(f"Best Val MSE:       {summary['best_val_loss']:.5f}")
+    if summary.get("best_val_loss") is not None and summary["best_val_loss"] < float("inf"):
+        print(f"Best Val MSE:       {summary['best_val_loss']:.5f} (step {summary.get('best_step')})")
     print(f"Checkpoint saved to: {args.output}")
 
 

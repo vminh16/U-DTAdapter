@@ -11,6 +11,7 @@ Performs:
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -28,6 +29,7 @@ from udt.dt_integration import (
     verify_b0_parity,
 )
 from udt.evaluation import evaluate_with_budget
+from udt.readiness import compute_file_sha256
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,6 +79,12 @@ def parse_args() -> argparse.Namespace:
         help="Output path for episode metrics JSON",
     )
     parser.add_argument(
+        "--allow-unsafe-legacy",
+        action="store_true",
+        default=False,
+        help="Allow loading legacy checkpoints with weights_only=False",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -87,6 +95,12 @@ def main() -> int:
     args = parse_args()
     device = torch.device(args.device)
 
+    # 0. Validate CLI inputs
+    if args.episodes <= 0:
+        raise ValueError(f"episodes must be positive, got {args.episodes}")
+    if args.horizon <= 0:
+        raise ValueError(f"horizon must be positive, got {args.horizon}")
+
     # 1. Load checkpoint and construct model
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.exists():
@@ -95,10 +109,26 @@ def main() -> int:
         return 1
 
     print(f"Loading Decision Transformer from {ckpt_path}...")
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    try:
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=not args.allow_unsafe_legacy)
+    except Exception as exc:
+        if not args.allow_unsafe_legacy and ("weights_only" in str(exc) or "Unsupported" in str(exc) or "pickle" in str(exc)):
+            raise ValueError(
+                f"Checkpoint loading failed with weights_only=True: {exc}. "
+                "Pass --allow-unsafe-legacy if you trust this checkpoint."
+            ) from exc
+        raise
 
-    state_dim = int(payload.get("state_dim", 11))
-    act_dim = int(payload.get("act_dim", 3))
+    if not isinstance(payload, dict):
+        raise ValueError("Checkpoint payload must be a dictionary")
+
+    required_keys = ["model_state_dict", "state_dim", "act_dim"]
+    missing = [k for k in required_keys if k not in payload]
+    if missing:
+        raise ValueError(f"Checkpoint is missing required metadata: {missing}")
+
+    state_dim = int(payload["state_dim"])
+    act_dim = int(payload["act_dim"])
     hidden_size = int(payload.get("hidden_size", 128))
     max_length = int(payload.get("max_length", 20))
     max_ep_len = int(payload.get("max_ep_len", args.horizon))
@@ -108,8 +138,13 @@ def main() -> int:
     state_std = payload.get("state_std")
     reward_scale = float(payload.get("reward_scale", 1000.0))
 
+    if args.horizon > max_ep_len:
+        raise ValueError(f"horizon ({args.horizon}) exceeds checkpoint max_ep_len ({max_ep_len})")
+    if args.horizon > 1024:
+        raise ValueError(f"horizon ({args.horizon}) exceeds positional embedding capacity (1024)")
+
     model, _ = load_decision_transformer(
-        checkpoint_path=ckpt_path,
+        checkpoint_path=payload,
         state_dim=state_dim,
         act_dim=act_dim,
         hidden_size=hidden_size,
@@ -118,6 +153,7 @@ def main() -> int:
         n_layer=n_layer,
         n_head=n_head,
         device=device,
+        allow_unsafe_legacy=args.allow_unsafe_legacy,
     )
 
     # 2. Assert strictly frozen
@@ -138,6 +174,14 @@ def main() -> int:
         print("Tip: ensure `mujoco` is installed: pip install mujoco imageio", file=sys.stderr)
         return 1
 
+    env_state_dim = env.observation_space.shape[0]
+    env_act_dim = env.action_space.shape[0]
+    if env_state_dim != state_dim or env_act_dim != act_dim:
+        raise ValueError(
+            f"Environment dimension mismatch: env (state_dim={env_state_dim}, act_dim={env_act_dim}) "
+            f"does not match checkpoint (state_dim={state_dim}, act_dim={act_dim})"
+        )
+
     action_low = env.action_space.low
     action_high = env.action_space.high
 
@@ -156,9 +200,13 @@ def main() -> int:
 
     # 5. Run Parity Verification
     print("Verifying B0 inference parity (DTAdapter vs Direct Model)...")
+    parity_steps = min(30, max_ep_len)
     parity_rng = np.random.default_rng(12345)
-    test_obs = [parity_rng.normal(size=state_dim).astype(np.float32) for _ in range(30)]
-    test_rtgs = [float(args.target_return / reward_scale) * (1.0 - t / 30.0) for t in range(30)]
+    test_obs = [parity_rng.normal(size=state_dim).astype(np.float32) for _ in range(parity_steps)]
+    test_rtgs = [
+        float(args.target_return / reward_scale) * (1.0 - t / float(parity_steps))
+        for t in range(parity_steps)
+    ]
 
     parity_report = verify_b0_parity(
         model=model,
@@ -175,7 +223,10 @@ def main() -> int:
     print(f"✓ Parity check: passed={parity_report['passed']} (max_diff={parity_report['max_abs_difference']:.2e}). Saved to {parity_file}")
 
     if not parity_report["passed"]:
-        print("Warning: Parity check failed! Rollout results may be ungrounded.", file=sys.stderr)
+        raise RuntimeError(
+            f"B0 inference parity check failed: max difference {parity_report['max_abs_difference']:.2e} "
+            f"exceeds tolerance {parity_report['tolerance']:.2e}."
+        )
 
     # 6. Run Closed-Loop B0 Evaluation Rollouts
     print(f"\nEvaluating Baseline B0 on {args.env} ({args.episodes} episodes, target return={args.target_return})...")
@@ -221,6 +272,15 @@ def main() -> int:
     returns_arr = np.array(episode_returns)
     lengths_arr = np.array(episode_lengths)
 
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        git_commit = "unknown"
+
+    checkpoint_sha256 = compute_file_sha256(ckpt_path) if ckpt_path.is_file() else "unknown"
+
     summary = {
         "variant": "B0",
         "env": args.env,
@@ -229,6 +289,21 @@ def main() -> int:
         "reward_scale": reward_scale,
         "horizon": args.horizon,
         "episodes": args.episodes,
+        "provenance": {
+            "checkpoint_sha256": checkpoint_sha256,
+            "git_commit": git_commit,
+            "torch_version": torch.__version__,
+        },
+        "environment_metadata": {
+            "evaluation_env": args.env,
+            "training_dataset_env": "hopper-medium-v2",
+            "d4rl_closed_loop_parity": "BLOCKED",
+            "d4rl_closed_loop_parity_reason": (
+                "Cross-version environment difference: Gymnasium Hopper-v4 (MuJoCo 3) vs "
+                "D4RL hopper-medium-v2 (Gym 0.21 / MuJoCo 2.1). Closed-loop rollout parity "
+                "cannot be evaluated directly without legacy gym environment."
+            ),
+        },
         "mean_return": float(returns_arr.mean()),
         "std_return": float(returns_arr.std()),
         "median_return": float(np.median(returns_arr)),

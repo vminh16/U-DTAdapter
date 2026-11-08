@@ -307,7 +307,7 @@ def test_train_decision_transformer_uses_baseline_sequence_trainer(tmp_path):
 
 
 def test_train_decision_transformer_in_memory_and_no_output_path():
-    # Pass in-memory dicts with no validation split
+    # Pass in-memory dicts with no validation split (using allow_no_validation=True)
     arrays = {
         "observations": np.ones((10, 2), dtype=np.float32),
         "actions": np.zeros((10, 1), dtype=np.float32),
@@ -315,6 +315,7 @@ def test_train_decision_transformer_in_memory_and_no_output_path():
         "returns_to_go": np.ones(10, dtype=np.float32),
         "timesteps": np.arange(10, dtype=np.int64),
         "episode_ids": np.zeros(10, dtype=np.int64),
+        "is_validation": np.zeros(10, dtype=bool),
     }
     manifest = {
         "state_mean": [0.0, 0.0],
@@ -334,6 +335,7 @@ def test_train_decision_transformer_in_memory_and_no_output_path():
         n_layer=1,
         n_head=1,
         eval_interval=None,
+        allow_no_validation=True,
         device="cpu",
     )
 

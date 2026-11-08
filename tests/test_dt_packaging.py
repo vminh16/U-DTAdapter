@@ -2,7 +2,10 @@ import os
 import sys
 from pathlib import Path
 import pytest
-import tomli
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from udt.dt_integration import (
     RealDTUnavailable,
@@ -16,7 +19,7 @@ def test_pyproject_toml_declares_baseline_dt_optional_dependency():
     """pyproject.toml must declare baseline optional dependencies."""
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     assert pyproject_path.exists()
-    content = tomli.loads(pyproject_path.read_text())
+    content = tomllib.loads(pyproject_path.read_text())
 
     opt_deps = content.get("project", {}).get("optional-dependencies", {})
     assert "baseline-dt" in opt_deps or "baseline" in opt_deps or "dt" in opt_deps
@@ -102,6 +105,7 @@ def test_train_decision_transformer_accepts_baseline_root(tmp_path):
         "returns_to_go": np.ones(4, dtype=np.float32),
         "timesteps": np.arange(4, dtype=np.int64),
         "episode_ids": np.zeros(4, dtype=np.int64),
+        "is_validation": np.zeros(4, dtype=bool),
     }
     manifest = {
         "state_mean": [0.0, 0.0],
@@ -114,5 +118,6 @@ def test_train_decision_transformer_accepts_baseline_root(tmp_path):
         train_decision_transformer(
             arrays,
             manifest,
+            allow_no_validation=True,
             baseline_root=tmp_path / "invalid_root",
         )

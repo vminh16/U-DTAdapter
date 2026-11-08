@@ -1,4 +1,6 @@
 {
+  "status": "INVALID_PENDING_RETRAINING",
+  "note": "Generated prior to fixing RTG double-scaling and checkpoint selection bugs. Invalid pending retraining.",
   "variant": "B0",
   "env": "Hopper-v4",
   "checkpoint": "checkpoints/decision_transformer/model.pt",

@@ -141,7 +141,7 @@ def load_frozen_dt_adapter(
 
 
 def load_decision_transformer(
-    checkpoint_path: str | Path,
+    checkpoint_path: str | Path | dict[str, Any],
     *,
     state_dim: int,
     act_dim: int,
@@ -161,21 +161,24 @@ def load_decision_transformer(
         RealDTUnavailable: If the baseline dependency tree (``transformers``)
             or the checkpoint cannot be loaded. This is intentionally loud.
     """
-    if not weights_only and not allow_unsafe_legacy:
-        raise ValueError(
-            "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
-            "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
-        )
+    if not isinstance(checkpoint_path, dict):
+        if not weights_only and not allow_unsafe_legacy:
+            raise ValueError(
+                "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
+                "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
+            )
 
-    if allow_unsafe_legacy:
-        import warnings
-        warnings.warn(
-            "Loading checkpoint with unsafe deserialization (weights_only=False). "
-            "Only do this for trusted legacy files.",
-            UserWarning,
-            stacklevel=2,
-        )
-        actual_weights_only = False
+        if allow_unsafe_legacy:
+            import warnings
+            warnings.warn(
+                "Loading checkpoint with unsafe deserialization (weights_only=False). "
+                "Only do this for trusted legacy files.",
+                UserWarning,
+                stacklevel=2,
+            )
+            actual_weights_only = False
+        else:
+            actual_weights_only = True
     else:
         actual_weights_only = True
 
@@ -196,7 +199,10 @@ def load_decision_transformer(
         resid_pdrop=0.1,
         attn_pdrop=0.1,
     )
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=actual_weights_only)
+    if isinstance(checkpoint_path, dict):
+        payload = checkpoint_path
+    else:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=actual_weights_only)
     state_dict = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
     model.load_state_dict(state_dict)
     model.to(torch.device(device))
@@ -224,6 +230,7 @@ def train_decision_transformer(
     eval_batches: int = 10,
     device: str | torch.device = "cpu",
     seed: int = 42,
+    allow_no_validation: bool = False,
     baseline_root: str | Path | None = None,
 ) -> tuple[nn.Module, dict[str, Any]]:
     """Train a Decision Transformer using the official baseline SequenceTrainer.
@@ -277,22 +284,61 @@ def train_decision_transformer(
     state_std = np.array(manifest_data["state_std"], dtype=np.float32)
     state_std = np.maximum(state_std, 1e-6)
     reward_scale = float(manifest_data.get("reward_scale", 1000.0))
+    if not np.isfinite(reward_scale) or reward_scale <= 0:
+        raise ValueError(f"reward_scale in manifest must be finite and positive, got {reward_scale}")
+
+    # Check dataset metadata if reward_scale is present in arrays
+    if "reward_scale" in arrays:
+        ds_scale = float(np.asarray(arrays["reward_scale"]).item())
+        if not np.isclose(ds_scale, reward_scale):
+            raise ValueError(
+                f"Dataset reward_scale ({ds_scale}) mismatch with manifest reward_scale ({reward_scale})"
+            )
     horizon = int(manifest_data.get("horizon", 1000))
 
     state_dim = state_mean.shape[0]
     act_dim = arrays["actions"].shape[1]
 
-    # 2. Extract trajectory-level train and validation splits
-    is_val_mask = arrays.get("is_validation")
-    episode_ids = arrays["episode_ids"]
+    # 2. Extract trajectory-level train and validation splits with strict leakage prevention
+    if "is_validation" not in arrays:
+        raise ValueError("Dataset is missing mandatory 'is_validation' split field.")
+    is_val_arr = np.asarray(arrays["is_validation"])
+    num_transitions = len(arrays["observations"])
+    if is_val_arr.ndim != 1 or len(is_val_arr) != num_transitions:
+        raise ValueError(
+            f"is_validation shape {is_val_arr.shape} is malformed; expected ({num_transitions},)"
+        )
+    if not (np.issubdtype(is_val_arr.dtype, np.bool_) or np.isin(is_val_arr, [0, 1]).all()):
+        raise ValueError("is_validation must contain boolean or binary (0, 1) flags.")
+    is_val_mask = is_val_arr.astype(bool)
+
+    if "episode_ids" not in arrays:
+        raise ValueError("Dataset is missing mandatory 'episode_ids' field.")
+    episode_ids = np.asarray(arrays["episode_ids"])
+    if episode_ids.ndim != 1 or len(episode_ids) != num_transitions:
+        raise ValueError(
+            f"episode_ids shape {episode_ids.shape} is malformed; expected ({num_transitions},)"
+        )
+
     unique_eids = np.unique(episode_ids)
 
     train_trajs: list[dict[str, np.ndarray]] = []
     val_trajs: list[dict[str, np.ndarray]] = []
+    train_eids: list[int] = []
+    val_eids: list[int] = []
 
     for eid in unique_eids:
         mask = episode_ids == eid
-        is_val_episode = bool(np.all(is_val_mask[mask])) if is_val_mask is not None else False
+        ep_val_flags = is_val_mask[mask]
+        has_val = bool(np.any(ep_val_flags))
+        all_val = bool(np.all(ep_val_flags))
+
+        # Trajectory-level split invariant: no episode may span both train and val splits
+        if has_val and not all_val:
+            raise ValueError(
+                f"Episode {eid} contains mixed train and validation transitions; trajectory split violated."
+            )
+
         terminals = (
             arrays["terminals"][mask]
             if "terminals" in arrays
@@ -306,14 +352,32 @@ def train_decision_transformer(
             "timesteps": arrays["timesteps"][mask],
             "terminals": terminals,
         }
-        if is_val_episode:
+        if all_val:
             val_trajs.append(traj)
+            val_eids.append(int(eid))
         else:
             train_trajs.append(traj)
+            train_eids.append(int(eid))
 
+    # Cross-check dataset split against manifest if present
+    if "train_episode_ids" in manifest_data:
+        manifest_train = set(manifest_data["train_episode_ids"])
+        if manifest_train and set(train_eids) != manifest_train:
+            raise ValueError(
+                f"Split mismatch: dataset train episode_ids {sorted(train_eids)} != manifest train_episode_ids {sorted(manifest_train)}"
+            )
+    if "validation_episode_ids" in manifest_data:
+        manifest_val = set(manifest_data["validation_episode_ids"])
+        if manifest_val and set(val_eids) != manifest_val:
+            raise ValueError(
+                f"Split mismatch: dataset val episode_ids {sorted(val_eids)} != manifest validation_episode_ids {sorted(manifest_val)}"
+            )
+
+    # Empty split checks: never silently fallback validation to training
     if not train_trajs:
-        train_trajs = val_trajs
-        val_trajs = []
+        raise ValueError("Training split is empty; at least one training trajectory required.")
+    if not val_trajs and not allow_no_validation:
+        raise ValueError("Validation split is empty; at least one validation trajectory required in B0 protocol.")
 
     # 3. Define batch sampler closure matching baseline SequenceTrainer.get_batch
     def _make_sampler(trajectories: list[dict[str, np.ndarray]]):
@@ -334,7 +398,7 @@ def train_decision_transformer(
                 traj_a = traj["actions"][si : si + k]
                 traj_r = traj["rewards"][si : si + k]
                 traj_rtg = traj["returns_to_go"][si : si + k + 1]
-                traj_t = traj["timesteps"][si : si + k]
+                traj_t = np.clip(traj["timesteps"][si : si + k], 0, horizon - 1)
                 traj_d = traj["terminals"][si : si + k]
 
                 cur_len = len(traj_s)
@@ -343,6 +407,16 @@ def train_decision_transformer(
                 norm_s = (traj_s - state_mean) / state_std
                 if len(traj_rtg) <= cur_len:
                     traj_rtg = np.append(traj_rtg, 0.0)
+
+                # Variable semantics:
+                # - raw_reward: r_t (unscaled environment reward)
+                # - scaled_reward: \rho_t = r_t / c
+                # - raw_return: G_t = \sum r_k
+                # - scaled_rtg: Y_t = G_t / c (computed once in prepare_dataset)
+                # - dt_rtg_token: token provided to DT model during training (Y_t) and inference (B_t)
+                # Note: traj["returns_to_go"] is ALREADY scaled by reward_scale (Y_t = G_t / c).
+                # Do NOT divide by reward_scale again to prevent double-scaling (G_t / c^2).
+                dt_rtg_token = traj_rtg[:, None] if traj_rtg.ndim == 1 else traj_rtg
 
                 if pad_len > 0:
                     pad_s = np.zeros((pad_len, state_dim), dtype=np.float32)
@@ -357,8 +431,7 @@ def train_decision_transformer(
                     a.append(np.vstack([pad_a, traj_a]))
                     r.append(np.vstack([pad_r, traj_r[:, None] if traj_r.ndim == 1 else traj_r]))
                     d.append(np.concatenate([pad_d, traj_d.astype(np.int64)]))
-                    scaled_rtg = (traj_rtg[:, None] if traj_rtg.ndim == 1 else traj_rtg) / reward_scale
-                    rtg.append(np.vstack([pad_rtg, scaled_rtg]))
+                    rtg.append(np.vstack([pad_rtg, dt_rtg_token]))
                     timesteps.append(np.concatenate([pad_t, traj_t]))
                     mask.append(np.concatenate([pad_m, np.ones(cur_len, dtype=np.float32)]))
                 else:
@@ -366,8 +439,7 @@ def train_decision_transformer(
                     a.append(traj_a)
                     r.append(traj_r[:, None] if traj_r.ndim == 1 else traj_r)
                     d.append(traj_d.astype(np.int64))
-                    scaled_rtg = (traj_rtg[:, None] if traj_rtg.ndim == 1 else traj_rtg) / reward_scale
-                    rtg.append(scaled_rtg)
+                    rtg.append(dt_rtg_token)
                     timesteps.append(traj_t)
                     mask.append(np.ones(cur_len, dtype=np.float32))
 
@@ -431,11 +503,13 @@ def train_decision_transformer(
     train_losses: list[float] = []
     val_losses: list[float] = []
     val_steps: list[int] = []
-    best_val_loss = float("inf")
+    best_val_loss: float | None = None
+    best_step: int | None = None
+    best_weights: dict[str, torch.Tensor] | None = None
 
     def _evaluate_validation() -> float:
         if val_sampler is None:
-            return 0.0
+            raise RuntimeError("Validation sampler is not available.")
         model.eval()
         losses: list[float] = []
         with torch.no_grad():
@@ -457,14 +531,21 @@ def train_decision_transformer(
             scheduler.step()
         train_losses.append(loss)
 
-        if eval_interval is not None and (step % eval_interval == 0 or step == num_steps):
+        if eval_interval is not None and val_sampler is not None and (step % eval_interval == 0 or step == num_steps):
             vloss = _evaluate_validation()
             val_losses.append(vloss)
             val_steps.append(step)
-            if vloss < best_val_loss:
+            if best_val_loss is None or vloss < best_val_loss:
                 best_val_loss = vloss
+                best_step = step
+                best_weights = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    # 6. Freeze model parameters strictly
+    # 6. Restore best validation checkpoint weights if validation was performed
+    if best_weights is not None:
+        model.load_state_dict(best_weights)
+        model.to(dev)
+
+    # 7. Freeze model parameters strictly and set to eval mode
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
@@ -473,6 +554,8 @@ def train_decision_transformer(
         "train_loss": train_losses,
         "val_loss": val_losses,
         "val_steps": val_steps,
+        "best_val_loss": best_val_loss,
+        "best_step": best_step,
     }
 
     if output_path is not None:
@@ -492,6 +575,7 @@ def train_decision_transformer(
                 "state_std": np.asarray(state_std, dtype=np.float32).tolist(),
                 "reward_scale": reward_scale,
                 "best_val_loss": best_val_loss,
+                "best_step": best_step,
                 "metrics": metrics,
             },
             out,
@@ -500,6 +584,7 @@ def train_decision_transformer(
     summary = {
         "metrics": metrics,
         "best_val_loss": best_val_loss,
+        "best_step": best_step,
         "num_train_trajectories": len(train_trajs),
         "num_val_trajectories": len(val_trajs),
     }
