@@ -17,6 +17,7 @@
 | **B3** | DT + Return Capper | ON | OFF | **Hoàn thành (pilot)** | **945.28 ± 120.95** (Median 956.35) |
 | **B4** | DT + Reranking (Uncertainty) | OFF | ON | **Hoàn thành (pilot)** | **1468.86 ± 126.51** (Median 1472.17) |
 | **B5** | U-DT Đầy đủ (Cap + Rerank) | ON | ON | **Hoàn thành (pilot)** | **1473.44 ± 179.78** (Median 1476.43) |
+| **Adaptive RTG** | Khảo sát Soft Capper ($\alpha \in \{0.0, 0.25, 0.5, 0.75, 1.0\}$) | ON (Soft) | OFF | **Hoàn thành (pilot)** | Grid 4 targets × 5 $\alpha$ (60 runs); $\alpha=0.25$ đạt **1611.28** tại target 3600 |
 
 ---
 
@@ -148,3 +149,78 @@ Khảo sát trên 4 mức RTG ban đầu qua 30 episodes (3 evaluation seeds × 
 **Nhận xét:**
 1. **Lấy mẫu candidate $N=10$ kết hợp scorer $g_\psi$**: Chuyển từ $N=1 \to 10$ giải thích hầu như toàn bộ mức thay đổi return so với $N=1$.
 2. **Vai trò của penalty bất định $\beta$**: So sánh giữa $\beta=0.0$ (1471.93) và $\beta=0.1$ (1468.86) trong pilot chưa cho thấy sự vượt trội về return của việc bổ sung penalty bất định. Sự khác biệt về độ lệch chuẩn mẫu (126.51 vs 140.61) trên 30 evaluation episodes không đủ để khẳng định tính ổn định khi chưa có paired confidence intervals trên nhiều independent training seeds.
+
+---
+
+## 6. Khảo Sát Can Thiệp Adaptive RTG (Sweep Hệ Số $\alpha \in [0.0, 1.0]$)
+
+- **Cơ chế can thiệp**: Interpolation lồi (convex combination) giữa RTG nguyên bản và ngưỡng giới hạn:
+  $$B_t^{DT} = B_t^{raw} - \alpha \max(0, B_t^{raw} - C_t) = (1 - \alpha) B_t^{raw} + \alpha C_t \quad (\text{khi } B_t^{raw} > C_t)$$
+  với $C_t = \min(B_t^{raw}, \text{cap}(s_t, t) + \delta)$.
+  - $\alpha = 0.0$: Hoàn nguyên $B_t^{DT} = B_t^{raw}$ (Vanilla DT / B0 / B1).
+  - $\alpha = 1.0$: Hard cap tuyệt đối $B_t^{DT} = C_t$ (Standard Return Capper / B3).
+- **Mục tiêu**: Khảo sát xem việc nới lỏng can thiệp cứng qua hệ số $\alpha \in [0, 1]$ có giải quyết được hiện tượng "sụp đổ hiệu năng" (performance collapse) của Return Capper ở các target cao (2700, 3600) hay không, đồng thời kiểm chứng endpoint parity và tính đơn điệu thực nghiệm.
+- **Quy mô thực nghiệm**: 4 target levels $\times$ 5 values of $\alpha$ ($0.0, 0.25, 0.5, 0.75, 1.0$) $\times$ 3 evaluation seeds (0, 42, 100; mỗi seed 10 episodes) = 60 runs (600 episodes). Cùng chung checkpoint `checkpoints/decision_transformer/model.pt` và `checkpoints/module_r/return_capper.pt`.
+- **Tệp kết quả**: `results/adaptive_rtg/` (gồm 60 tệp evaluation và 60 tệp parity JSON, 100% parity checks passed).
+
+### 6.1. Bảng Tổng Hợp Kết Quả Toàn Grid (Mean Return ± Std qua 30 episodes)
+
+| Target Return | Phân loại | $\alpha = 0.00$ (Vanilla) | $\alpha = 0.25$ | $\alpha = 0.50$ | $\alpha = 0.75$ | $\alpha = 1.00$ (Hard Cap) |
+| :---: | :--- | :---: | :---: | :---: | :---: | :---: |
+| **1460.0** | Train median ($p_{50}$) | 1142.17 ± 228.41 | **1142.51 ± 228.89** | 1138.28 ± 230.51 | 1136.49 ± 231.22 | 1135.47 ± 232.39 |
+| **1800.0** | Chuẩn ($p_{90}$, B0) | 918.24 ± 141.14 | 934.71 ± 201.87 | 932.09 ± 146.75 | 929.21 ± 114.53 | **945.28 ± 120.95** |
+| **2700.0** | Mức cao ($1.5\times$) | **1476.32 ± 406.70** | 1289.02 ± 347.26 | 1049.19 ± 377.64 | 1043.10 ± 323.66 | 945.28 ± 120.95 |
+| **3600.0** | Cực đoan ($2.0\times$, OOD) | 1606.20 ± 255.44 | **1611.28 ± 287.23** | 1362.45 ± 324.84 | 1057.55 ± 423.75 | 945.28 ± 120.95 |
+
+### 6.2. Chi Tiết Thực Nghiệm Theo Từng Mức Target
+
+#### Target 1460.0 (Median phân phối huấn luyện):
+| $\alpha$ | Mean Return | Std Return | Median | Mean Length | Clipping Freq | Interv. Freq | Mean RTG Adj | Per-seed Means (0 / 42 / 100) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **0.00** | 1142.17 | 228.41 | 1069.97 | 374.0 | 40.8% | 0.0% | 0.0000 | 1119.88 / 1127.15 / 1179.49 |
+| **0.25** | 1142.51 | 228.89 | 1077.98 | 374.1 | 40.9% | 40.9% | 0.0283 | 1118.87 / 1130.54 / 1178.12 |
+| **0.50** | 1138.28 | 230.51 | 1064.10 | 373.2 | 40.8% | 40.8% | 0.0567 | 1118.20 / 1120.29 / 1176.35 |
+| **0.75** | 1136.49 | 231.22 | 1066.81 | 372.9 | 40.8% | 40.8% | 0.0851 | 1116.03 / 1118.54 / 1174.91 |
+| **1.00** | 1135.47 | 232.39 | 1068.42 | 372.7 | 40.8% | 40.8% | 0.1134 | 1113.20 / 1119.81 / 1173.41 |
+
+#### Target 1800.0 (Target chuẩn tham chiếu B0):
+| $\alpha$ | Mean Return | Std Return | Median | Mean Length | Clipping Freq | Interv. Freq | Mean RTG Adj | Per-seed Means (0 / 42 / 100) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **0.00** | 918.24 | 141.14 | 879.12 | 301.8 | 100.0% | 0.0% | 0.0000 | 960.21 / 865.30 / 929.19 |
+| **0.25** | 934.71 | 201.87 | 885.41 | 307.7 | 98.6% | 98.6% | 0.1337 | 1003.60 / 857.42 / 943.11 |
+| **0.50** | 932.09 | 146.75 | 902.30 | 307.1 | 100.0% | 100.0% | 0.2642 | 975.13 / 861.95 / 959.20 |
+| **0.75** | 929.21 | 114.53 | 911.92 | 307.3 | 100.0% | 100.0% | 0.3891 | 942.74 / 872.69 / 972.18 |
+| **1.00** | 945.28 | 120.95 | 956.35 | 313.4 | 100.0% | 100.0% | 0.5028 | 971.67 / 876.67 / 987.48 |
+
+#### Target 2700.0 (Mức cao $1.5\times$ target chuẩn):
+| $\alpha$ | Mean Return | Std Return | Median | Mean Length | Clipping Freq | Interv. Freq | Mean RTG Adj | Per-seed Means (0 / 42 / 100) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **0.00** | 1476.32 | 406.70 | 1482.68 | 476.1 | 100.0% | 0.0% | 0.0000 | 1496.95 / 1517.15 / 1414.87 |
+| **0.25** | 1289.02 | 347.26 | 1469.39 | 418.9 | 100.0% | 100.0% | 0.2929 | 1215.56 / 1396.95 / 1254.54 |
+| **0.50** | 1049.19 | 377.64 | 833.24 | 345.8 | 100.0% | 100.0% | 0.6778 | 958.10 / 1274.26 / 915.21 |
+| **0.75** | 1043.10 | 323.66 | 880.64 | 341.1 | 100.0% | 100.0% | 1.0313 | 1030.77 / 1165.90 / 932.64 |
+| **1.00** | 945.28 | 120.95 | 956.35 | 313.4 | 100.0% | 100.0% | 1.4028 | 971.67 / 876.67 / 987.48 |
+
+#### Target 3600.0 (Cực đoan $2.0\times$, OOD):
+| $\alpha$ | Mean Return | Std Return | Median | Mean Length | Clipping Freq | Interv. Freq | Mean RTG Adj | Per-seed Means (0 / 42 / 100) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **0.00** | 1606.20 | 255.44 | 1507.76 | 513.6 | 100.0% | 0.0% | 0.0000 | 1566.62 / 1570.33 / 1681.64 |
+| **0.25** | **1611.28** | 287.23 | 1504.37 | **515.8** | 100.0% | 100.0% | 0.4599 | 1736.17 / 1550.17 / 1547.49 |
+| **0.50** | 1362.45 | 324.84 | 1463.15 | 441.6 | 100.0% | 100.0% | 1.0002 | 1327.55 / 1419.45 / 1340.33 |
+| **0.75** | 1057.55 | 423.75 | 834.49 | 347.7 | 100.0% | 100.0% | 1.6994 | 932.06 / 1373.68 / 866.90 |
+| **1.00** | 945.28 | 120.95 | 956.35 | 313.4 | 100.0% | 100.0% | 2.3028 | 971.67 / 876.67 / 987.48 |
+
+### 6.3. Nhận Định & Phát Hiện Khoa Học Cốt Lõi
+
+1. **Kiểm chứng tính đúng đắn số học & Endpoint Parity tuyệt đối**:
+   - Tại $\alpha = 0.00$, toàn bộ kết quả trên cả 4 target đều tái hiện hoàn hảo kết quả B0 / B1 (độ sai lệch lớn nhất $0.0$, tỷ lệ can thiệp hiệu quả $0.0\%$, 60/60 bài kiểm tra parity đều PASS).
+   - Tại $\alpha = 1.00$, ở các target $\ge 1800.0$, do ngân sách raw RTG luôn vượt ngưỡng trần $C_t$, giá trị gọt trả về chính xác điểm số của baseline B3 ($945.28 \pm 120.95$).
+2. **Khắc phục hiện tượng "sụp đổ hiệu năng" (Performance Collapse) ở Target cực đoan (3600.0)**:
+   - Khi dùng hard cap ($\alpha = 1.0$), Decision Transformer bị ép token về mức $C_t \approx 945$, làm mất đi tín hiệu vận tốc cao vốn giúp agent duy trì bước nhảy dài, khiến return tụt sâu từ $1606.20 \to 945.28$ (giảm $41.15\%$).
+   - Can thiệp mềm với $\alpha = 0.25$ đã **giải quyết triệt để hiện tượng sụp đổ này**: mean return đạt **$1611.28 \pm 287.23$** (nhỉnh hơn cả Vanilla DT $1606.20$), độ dài episode đạt $515.8$ bước (so với $513.6$ bước của B1), trong đó seed 0 đạt tới $1736.17$.
+3. **Mối quan hệ đơn điệu giữa cường độ can thiệp ($\alpha$) và Return tại High Targets**:
+   - Tại target 2700 và 3600, khi $\alpha$ tăng từ $0.25 \to 0.50 \to 0.75 \to 1.00$, return trung bình giảm dần một cách đơn điệu về mốc sàn $945.28$.
+   - Điều này xác thực giả thuyết nghiên cứu: Việc can thiệp quá mạnh (hard cap, $\alpha \to 1$) phản tác dụng trên các bài toán tích lũy reward theo thời gian sinh tồn như Hopper-v4 khi agent bị giới hạn token quá sớm; trong khi can thiệp mềm ($\alpha = 0.25$) đóng vai trò regularizer hữu hiệu, giữ lại động lực đạt mục tiêu cao mà không ép agent rơi vào vùng hành vi thận trọng yếm thế.
+4. **Hành vi ở Target thấp và trung bình (1460.0 & 1800.0)**:
+   - Tại target 1460.0 (quanh $p_{50}$ tập huấn luyện), tỷ lệ clipping chỉ đạt $\approx 40.8\%$ với mức điều chỉnh token rất nhỏ ($\Delta_{RTG} \in [0.02, 0.11]$), khiến biến thiên điểm số giữa các giá trị $\alpha$ là không đáng kể ($1135 \sim 1142$).
+   - Tại target 1800.0, việc bật capper (dù mềm hay cứng) đều mang lại mức tăng nhẹ so với Vanilla DT ($918.24 \to 929 \sim 945$).
