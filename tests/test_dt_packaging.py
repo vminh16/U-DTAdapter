@@ -15,17 +15,26 @@ from udt.dt_integration import (
 )
 
 
-def test_pyproject_toml_declares_baseline_dt_optional_dependency():
-    """pyproject.toml must declare baseline optional dependencies."""
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    assert pyproject_path.exists()
-    content = tomllib.loads(pyproject_path.read_text())
+def test_pyproject_has_no_duplicate_dependency_lists():
+    """Dependencies live in requirements.txt; pyproject only holds build metadata."""
+    root = Path(__file__).resolve().parents[1]
+    content = tomllib.loads((root / "pyproject.toml").read_text())
+    project = content.get("project", {})
+    assert "dependencies" not in project
+    assert "optional-dependencies" not in project
+    assert "scripts" not in project
 
-    opt_deps = content.get("project", {}).get("optional-dependencies", {})
-    assert "baseline-dt" in opt_deps or "baseline" in opt_deps or "dt" in opt_deps
-    key = "baseline-dt" if "baseline-dt" in opt_deps else ("baseline" if "baseline" in opt_deps else "dt")
-    deps = opt_deps[key]
-    assert any("transformers" in dep for dep in deps)
+    requirements = (root / "requirements.txt").read_text()
+    assert "transformers==4.18.0" in requirements
+    assert "gymnasium[mujoco]==1.2.3" in requirements
+    assert "pytest" in requirements
+    assert not (root / "requirements-dev.txt").exists()
+
+
+def test_legacy_entrypoints_are_removed():
+    root = Path(__file__).resolve().parents[1]
+    for legacy in ("run.py", "src/udt/cli.py", "src/udt/__main__.py", "scripts/evaluate_b0.py"):
+        assert not (root / legacy).exists(), legacy
 
 
 def test_import_baseline_dt_accepts_explicit_path():

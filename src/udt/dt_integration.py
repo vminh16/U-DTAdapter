@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from udt.checkpoint import load_checkpoint_payload
 from udt.dt_adapter import DTAdapter
 
 
@@ -161,26 +162,14 @@ def load_decision_transformer(
         RealDTUnavailable: If the baseline dependency tree (``transformers``)
             or the checkpoint cannot be loaded. This is intentionally loud.
     """
-    if not isinstance(checkpoint_path, dict):
-        if not weights_only and not allow_unsafe_legacy:
-            raise ValueError(
-                "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
-                "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
-            )
-
-        if allow_unsafe_legacy:
-            import warnings
-            warnings.warn(
-                "Loading checkpoint with unsafe deserialization (weights_only=False). "
-                "Only do this for trusted legacy files.",
-                UserWarning,
-                stacklevel=2,
-            )
-            actual_weights_only = False
-        else:
-            actual_weights_only = True
+    if isinstance(checkpoint_path, dict):
+        payload = checkpoint_path
     else:
-        actual_weights_only = True
+        payload = load_checkpoint_payload(
+            checkpoint_path,
+            weights_only=weights_only,
+            allow_unsafe_legacy=allow_unsafe_legacy,
+        )
 
     DecisionTransformer, _ = _import_baseline_dt(baseline_root=baseline_root)
 
@@ -199,10 +188,6 @@ def load_decision_transformer(
         resid_pdrop=0.1,
         attn_pdrop=0.1,
     )
-    if isinstance(checkpoint_path, dict):
-        payload = checkpoint_path
-    else:
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=actual_weights_only)
     state_dict = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
     model.load_state_dict(state_dict)
     model.to(torch.device(device))
@@ -210,6 +195,70 @@ def load_decision_transformer(
     for parameter in model.parameters():
         parameter.requires_grad = False
     return model, payload if isinstance(payload, dict) else {"state_dict": payload}
+
+
+def load_dt_checkpoint(
+    path: str | Path,
+    *,
+    horizon: int | None = None,
+    device: str | torch.device = "cpu",
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
+    weights_only: bool = True,
+    allow_unsafe_legacy: bool = False,
+    baseline_root: str | Path | None = None,
+) -> tuple[DTAdapter, dict[str, Any]]:
+    """Load a trained frozen Decision Transformer and wrap it for inference."""
+    payload = load_checkpoint_payload(
+        path,
+        weights_only=weights_only,
+        allow_unsafe_legacy=allow_unsafe_legacy,
+    )
+    required = ("model_state_dict", "state_dim", "act_dim")
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError(f"Checkpoint is missing required metadata: {missing}")
+
+    state_dim = int(payload["state_dim"])
+    act_dim = int(payload["act_dim"])
+    hidden_size = int(payload.get("hidden_size", 128))
+    max_length = int(payload.get("max_length", 20))
+    max_ep_len = int(payload.get("max_ep_len", horizon or 1000))
+    n_layer = int(payload.get("n_layer", 3))
+    n_head = int(payload.get("n_head", 1))
+
+    if horizon is not None:
+        if int(horizon) > max_ep_len:
+            raise ValueError(f"horizon ({horizon}) exceeds checkpoint max_ep_len ({max_ep_len})")
+        if int(horizon) > 1024:
+            raise ValueError("horizon exceeds positional embedding capacity (1024)")
+
+    model, _ = load_decision_transformer(
+        checkpoint_path=payload,
+        state_dim=state_dim,
+        act_dim=act_dim,
+        hidden_size=hidden_size,
+        max_length=max_length,
+        max_ep_len=max_ep_len,
+        n_layer=n_layer,
+        n_head=n_head,
+        device=device,
+        allow_unsafe_legacy=allow_unsafe_legacy,
+        baseline_root=baseline_root,
+    )
+    assert_parameters_frozen(model)
+    adapter = load_frozen_dt_adapter(
+        model,
+        state_dim=state_dim,
+        act_dim=act_dim,
+        max_length=max_length,
+        state_mean=payload.get("state_mean"),
+        state_std=payload.get("state_std"),
+        action_low=action_low,
+        action_high=action_high,
+        device=device,
+    )
+    return adapter, payload
 
 
 def train_decision_transformer(
@@ -667,6 +716,38 @@ def verify_b0_parity(
         "model_source": model_source,
         "steps": len(differences),
     }
+
+
+def verify_b0_checkpoint_parity(
+    adapter: DTAdapter,
+    *,
+    target_return: float,
+    reward_scale: float,
+    max_ep_len: int,
+    steps: int = 30,
+    seed: int = 12345,
+    atol: float = 1e-6,
+) -> dict[str, Any]:
+    """Deterministically compare adapter B0 inference with direct model inference."""
+    parity_steps = min(int(steps), int(max_ep_len))
+    if parity_steps < 1:
+        raise ValueError("max_ep_len must allow at least one parity step")
+    rng = np.random.default_rng(seed)
+    observations = [
+        rng.normal(size=adapter.state_dim).astype(np.float32) for _ in range(parity_steps)
+    ]
+    rtg_tokens = [
+        float(target_return / reward_scale) * (1.0 - step / float(parity_steps))
+        for step in range(parity_steps)
+    ]
+    return verify_b0_parity(
+        model=adapter.model,
+        adapter=adapter,
+        observations=observations,
+        rtg_tokens=rtg_tokens,
+        atol=atol,
+        model_source="real",
+    )
 
 
 def assert_parameters_frozen(model: nn.Module) -> None:

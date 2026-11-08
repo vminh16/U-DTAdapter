@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from udt.checkpoint import load_checkpoint_payload
 from udt.dt_adapter import DTAdapter
 from udt.intervention import ensemble_scores, propose_actions
 from udt.return_cap import ReturnCapper
@@ -919,26 +920,12 @@ def load_dynamics_checkpoint(
     allow_unsafe_legacy: bool = False,
 ) -> tuple[DynamicsEnsemble, dict[str, Any]]:
     """Load a dynamics checkpoint and reject incompatible configurations."""
-    if not weights_only and not allow_unsafe_legacy:
-        raise ValueError(
-            "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
-            "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
-        )
-
-    if allow_unsafe_legacy:
-        import warnings
-        warnings.warn(
-            "Loading checkpoint with unsafe deserialization (weights_only=False). "
-            "Only do this for trusted legacy files.",
-            UserWarning,
-            stacklevel=2,
-        )
-        actual_weights_only = False
-    else:
-        actual_weights_only = True
-
-    payload = torch.load(path, map_location="cpu", weights_only=actual_weights_only)
-    if not isinstance(payload, dict) or payload.get("kind") != "udt_dynamics_ensemble":
+    payload = load_checkpoint_payload(
+        path,
+        weights_only=weights_only,
+        allow_unsafe_legacy=allow_unsafe_legacy,
+    )
+    if payload.get("kind") != "udt_dynamics_ensemble":
         raise ValueError(f"{path} is not a U-DT dynamics ensemble checkpoint")
     if payload.get("format_version") != 1:
         raise ValueError(

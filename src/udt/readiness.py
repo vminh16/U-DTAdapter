@@ -12,24 +12,30 @@ research validation.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from udt.checkpoint import load_checkpoint_payload
+from udt.provenance import compute_file_sha256
+
 SUPPORTED_VARIANTS = ("B0", "B3", "B4", "B5")
 _LOGICAL_SPLIT_KEYS = ("train_episode_ids", "validation_episode_ids", "test_episode_ids")
 
 
-def compute_file_sha256(path: str | Path) -> str:
-    """Compute SHA-256 of a file without loading it into memory."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _requires_return(variants: Sequence[str]) -> bool:
+    """B3 needs a capper; B4/B5 need the g_psi return model."""
+    return any(variant in ("B3", "B4", "B5") for variant in variants)
+
+
+def _requires_dynamics(variants: Sequence[str]) -> bool:
+    return any(variant in ("B4", "B5") for variant in variants)
+
+
+def _not_required(detail: str) -> dict[str, Any]:
+    return _check("pass", detail)
 
 
 def _check(status: str, detail: str, **evidence: Any) -> dict[str, Any]:
@@ -48,37 +54,11 @@ def _load_payload(
     weights_only: bool = True,
     allow_unsafe_legacy: bool = False,
 ) -> dict[str, Any]:
-    path = Path(path)
-    if path.suffix.lower() == ".json":
-        payload = json.loads(path.read_text())
-        if not isinstance(payload, dict):
-            raise ValueError(f"{path} does not contain a JSON object")
-        return payload
-
-    import torch
-
-    if not weights_only and not allow_unsafe_legacy:
-        raise ValueError(
-            "Loading checkpoints with weights_only=False is unsafe and prohibited by default. "
-            "Pass allow_unsafe_legacy=True explicitly to opt into loading trusted legacy checkpoints."
-        )
-
-    if allow_unsafe_legacy:
-        import warnings
-        warnings.warn(
-            "Loading checkpoint with unsafe deserialization (weights_only=False). "
-            "Only do this for trusted legacy files.",
-            UserWarning,
-            stacklevel=2,
-        )
-        actual_weights_only = False
-    else:
-        actual_weights_only = True
-
-    payload = torch.load(path, map_location="cpu", weights_only=actual_weights_only)
-    if not isinstance(payload, dict):
-        raise ValueError(f"{path} does not contain a dictionary payload")
-    return payload
+    return load_checkpoint_payload(
+        path,
+        weights_only=weights_only,
+        allow_unsafe_legacy=allow_unsafe_legacy,
+    )
 
 
 def _recorded_hashes(
@@ -122,12 +102,14 @@ def _normalization_stats(
 def _return_stats(
     return_model: Any | None,
     return_payload: Mapping[str, Any] | None,
+    capper: Any | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    if return_model is not None and getattr(return_model, "state_mean", None) is not None:
-        return (
-            np.asarray(return_model.state_mean, dtype=np.float64),
-            np.asarray(return_model.state_std, dtype=np.float64),
-        )
+    for candidate in (return_model, capper):
+        if candidate is not None and getattr(candidate, "state_mean", None) is not None:
+            return (
+                np.asarray(candidate.state_mean, dtype=np.float64),
+                np.asarray(candidate.state_std, dtype=np.float64),
+            )
     payload = return_payload or {}
     if payload.get("state_mean") is not None and payload.get("state_std") is not None:
         return (
@@ -171,6 +153,8 @@ def _torch_load_if_needed(
         return None
     try:
         return _load_payload(checkpoint, weights_only=weights_only, allow_unsafe_legacy=allow_unsafe_legacy)
+    except FileNotFoundError:
+        return None
     except Exception as exc:  # report as evidence instead of crashing readiness
         return {"_load_error": f"{type(exc).__name__}: {exc}", "_path": str(checkpoint)}
 
@@ -335,7 +319,16 @@ def _check_bootstrap(
     dynamics_payload: Mapping[str, Any] | None,
     manifest: Mapping[str, Any] | None,
     ensemble: Any | None,
+    *,
+    required: bool = True,
 ) -> dict[str, Any]:
+    if not required:
+        return _not_required("No U variant was requested; bootstrap metadata is not required.")
+    if dynamics_payload is None and ensemble is None:
+        return _check(
+            "blocked",
+            "Dynamics checkpoint not supplied; bootstrap metadata cannot be verified.",
+        )
     metrics = (dynamics_payload or {}).get("metrics") or {}
     models = metrics.get("models") or []
     if not models:
@@ -410,60 +403,93 @@ def _check_normalization(
     dynamics_payload: Mapping[str, Any] | None,
     return_model: Any | None,
     return_payload: Mapping[str, Any] | None,
+    capper: Any | None = None,
+    *,
+    require_dynamics: bool = True,
+    require_return: bool = True,
 ) -> dict[str, Any]:
-    mean, std, source = _normalization_stats(ensemble, dynamics_payload)
-    if mean is None or std is None:
-        return _check("fail", "Dynamics normalization statistics are missing.")
-    if mean.shape != std.shape or mean.ndim != 1:
-        return _check(
-            "fail",
-            "Dynamics state_mean/state_std must be matching 1-D arrays.",
-            mean_shape=list(mean.shape),
-            std_shape=list(std.shape),
-        )
-    if not np.isfinite(mean).all() or not np.isfinite(std).all():
-        return _check("fail", "Dynamics normalization statistics contain non-finite values.")
-    if np.any(std <= 0):
-        return _check("fail", "Dynamics state_std must be strictly positive.")
-    coordinate_system = ((dynamics_payload or {}).get("normalization") or {}).get(
-        "coordinate_system"
-    )
-    if dynamics_payload is not None and coordinate_system != "raw_observation":
-        return _check(
-            "fail",
-            "Dynamics normalization coordinate_system must be 'raw_observation'.",
-            coordinate_system=coordinate_system,
+    if not require_dynamics and not require_return:
+        return _not_required(
+            "No U or R variant was requested; normalization statistics are not required."
         )
 
-    norm_dict: Mapping[str, Any] = {}
-    if dynamics_payload is not None and isinstance(dynamics_payload.get("normalization"), Mapping):
-        norm_dict = dynamics_payload["normalization"]
-    elif ensemble is not None and isinstance(getattr(ensemble, "normalization_provenance", None), Mapping):
-        norm_dict = ensemble.normalization_provenance
-
-    norm_source = norm_dict.get("source", "external_unverified")
-    norm_verified = norm_dict.get("verified", False)
-    if norm_source == "external_unverified" or not norm_verified:
-        return _check(
-            "blocked",
-            "Dynamics normalization statistics are unverified or lack evidence of train-only computation.",
-            source=norm_source,
-            verified=norm_verified,
+    mean = std = None
+    source = "not_required"
+    if require_dynamics:
+        if dynamics_payload is None and ensemble is None:
+            return _check(
+                "blocked",
+                "Dynamics checkpoint not supplied; normalization cannot be verified.",
+            )
+        mean, std, source = _normalization_stats(ensemble, dynamics_payload)
+        if mean is None or std is None:
+            return _check("fail", "Dynamics normalization statistics are missing.")
+        if mean.shape != std.shape or mean.ndim != 1:
+            return _check(
+                "fail",
+                "Dynamics state_mean/state_std must be matching 1-D arrays.",
+                mean_shape=list(mean.shape),
+                std_shape=list(std.shape),
+            )
+        if not np.isfinite(mean).all() or not np.isfinite(std).all():
+            return _check("fail", "Dynamics normalization statistics contain non-finite values.")
+        if np.any(std <= 0):
+            return _check("fail", "Dynamics state_std must be strictly positive.")
+        coordinate_system = ((dynamics_payload or {}).get("normalization") or {}).get(
+            "coordinate_system"
         )
+        if dynamics_payload is not None and coordinate_system != "raw_observation":
+            return _check(
+                "fail",
+                "Dynamics normalization coordinate_system must be 'raw_observation'.",
+                coordinate_system=coordinate_system,
+            )
 
-    r_mean, r_std = _return_stats(return_model, return_payload)
-    if r_mean is not None and r_std is not None:
+        norm_dict: Mapping[str, Any] = {}
+        if dynamics_payload is not None and isinstance(dynamics_payload.get("normalization"), Mapping):
+            norm_dict = dynamics_payload["normalization"]
+        elif ensemble is not None and isinstance(getattr(ensemble, "normalization_provenance", None), Mapping):
+            norm_dict = ensemble.normalization_provenance
+
+        norm_source = norm_dict.get("source", "external_unverified")
+        norm_verified = norm_dict.get("verified", False)
+        if norm_source == "external_unverified" or not norm_verified:
+            return _check(
+                "blocked",
+                "Dynamics normalization statistics are unverified or lack evidence of train-only computation.",
+                source=norm_source,
+                verified=norm_verified,
+            )
+
+    if require_return:
+        if return_payload is None and return_model is None and capper is None:
+            return _check(
+                "blocked",
+                "Return checkpoint not supplied; normalization cannot be verified.",
+            )
+        r_mean, r_std = _return_stats(return_model, return_payload, capper)
+        if r_mean is None or r_std is None:
+            return _check("fail", "Return-model normalization statistics are missing.")
         if r_mean.shape != r_std.shape or not np.isfinite(r_mean).all() or not np.isfinite(r_std).all():
             return _check("fail", "Return-model normalization statistics are invalid.")
         if np.any(r_std <= 0):
             return _check("fail", "Return-model state_std must be strictly positive.")
-        if r_mean.shape != mean.shape:
+        if mean is not None and r_mean.shape != mean.shape:
             return _check(
                 "fail",
                 "Return-model normalization dimension differs from dynamics.",
                 dynamics_dim=int(mean.shape[0]),
                 return_dim=int(r_mean.shape[0]),
             )
+    else:
+        r_mean = None
+
+    if mean is None:
+        return _check(
+            "pass",
+            "Return-model normalization statistics are finite and positive.",
+            source="return_only",
+        )
     return _check(
         "pass",
         "Normalization statistics are finite, positive, and consistent.",
@@ -491,7 +517,7 @@ def _check_components(
     available = ["B0"]
     if has_r:
         available.append("B3")
-    if has_u:
+    if has_u and has_r:
         available.append("B4")
     if has_r and has_u:
         available.append("B5")
@@ -499,8 +525,8 @@ def _check_components(
     missing = [variant for variant in requested if variant not in available]
     if missing:
         return _check(
-            "fail",
-            f"Required variants are unavailable: {missing}",
+            "blocked",
+            f"Required variants are unavailable because artifacts are missing: {missing}",
             available_variants=available,
             has_r=has_r,
             has_u=has_u,
@@ -531,56 +557,74 @@ def _check_traceability(
     return_checkpoint: str | Path | None,
     dynamics_payload: Mapping[str, Any] | None,
     return_payload: Mapping[str, Any] | None,
+    *,
+    require_dynamics: bool = True,
+    require_return: bool = True,
 ) -> dict[str, Any]:
+    if not require_dynamics and not require_return:
+        return _not_required(
+            "No U or R variant was requested; checkpoint traceability is not required."
+        )
     problems: list[str] = []
+    missing: list[str] = []
     hashes: dict[str, str] = {}
-    for name, path, payload in (
-        ("dynamics", dynamics_checkpoint, dynamics_payload),
-        ("return", return_checkpoint, return_payload),
+    for name, path, payload, required in (
+        ("dynamics", dynamics_checkpoint, dynamics_payload, require_dynamics),
+        ("return", return_checkpoint, return_payload, require_return),
     ):
+        if not required:
+            continue
         if payload is not None and payload.get("_load_error"):
             problems.append(f"{name} checkpoint could not be loaded: {payload['_load_error']}")
             continue
         if path is None:
-            problems.append(f"{name} checkpoint path not supplied")
+            missing.append(f"{name} checkpoint path not supplied")
             continue
         path = Path(path)
         if not path.exists():
-            problems.append(f"{name} checkpoint missing: {path}")
+            missing.append(f"{name} checkpoint missing: {path}")
             continue
         hashes[name] = compute_file_sha256(path)
 
-    dynamics_metrics = (dynamics_payload or {}).get("metrics") or {}
-    if not dynamics_metrics.get("models"):
-        problems.append("dynamics checkpoint has no per-head metrics")
-    if dynamics_metrics.get("base_seed") is None:
-        problems.append("dynamics metrics missing base_seed")
-    if not dynamics_metrics.get("training_config"):
-        problems.append("dynamics metrics missing training_config")
-    if dynamics_payload is not None:
-        num_models = (dynamics_payload.get("architecture") or {}).get("num_models")
-        init_seeds = dynamics_payload.get("init_seeds")
-        bootstrap = dynamics_payload.get("bootstrap")
-        if num_models is not None:
-            if init_seeds is None or len(init_seeds) != int(num_models):
-                problems.append("checkpoint init_seeds do not match num_models")
-            if bootstrap is None or len(bootstrap) != int(num_models):
-                problems.append("checkpoint bootstrap records do not match num_models")
+    if require_dynamics:
+        dynamics_metrics = (dynamics_payload or {}).get("metrics") or {}
+        if not dynamics_metrics.get("models"):
+            problems.append("dynamics checkpoint has no per-head metrics")
+        if dynamics_metrics.get("base_seed") is None:
+            problems.append("dynamics metrics missing base_seed")
+        if not dynamics_metrics.get("training_config"):
+            problems.append("dynamics metrics missing training_config")
+        if dynamics_payload is not None:
+            num_models = (dynamics_payload.get("architecture") or {}).get("num_models")
+            init_seeds = dynamics_payload.get("init_seeds")
+            bootstrap = dynamics_payload.get("bootstrap")
+            if num_models is not None:
+                if init_seeds is None or len(init_seeds) != int(num_models):
+                    problems.append("checkpoint init_seeds do not match num_models")
+                if bootstrap is None or len(bootstrap) != int(num_models):
+                    problems.append("checkpoint bootstrap records do not match num_models")
 
-    if return_payload is not None:
-        metrics = return_payload.get("metrics") or {}
-        if metrics.get("best_val_loss") is None or not np.isfinite(metrics["best_val_loss"]):
-            problems.append("return checkpoint metrics missing finite best_val_loss")
-        coverage = metrics.get("best_val_coverage")
-        if coverage is None or not (0.0 <= float(coverage) <= 1.0):
-            problems.append("return checkpoint metrics missing best_val_coverage in [0, 1]")
-        if "restored_checkpoint_evaluation" not in metrics:
-            problems.append("return checkpoint metrics do not re-evaluate the restored model")
-        if return_payload.get("horizon") is None or return_payload.get("scale") is None:
-            problems.append("return checkpoint missing horizon/scale")
-    elif return_checkpoint is not None:
-        problems.append("return checkpoint payload could not be inspected")
+    if require_return:
+        if return_payload is not None:
+            metrics = return_payload.get("metrics") or {}
+            if metrics.get("best_val_loss") is None or not np.isfinite(metrics["best_val_loss"]):
+                problems.append("return checkpoint metrics missing finite best_val_loss")
+            coverage = metrics.get("best_val_coverage")
+            if coverage is None or not (0.0 <= float(coverage) <= 1.0):
+                problems.append("return checkpoint metrics missing best_val_coverage in [0, 1]")
+            if "restored_checkpoint_evaluation" not in metrics:
+                problems.append("return checkpoint metrics do not re-evaluate the restored model")
+            if return_payload.get("horizon") is None or return_payload.get("scale") is None:
+                problems.append("return checkpoint missing horizon/scale")
+        elif return_checkpoint is not None:
+            problems.append("return checkpoint payload could not be inspected")
 
+    if missing:
+        return _check(
+            "blocked",
+            "Required checkpoints are missing; traceability cannot be verified.",
+            problems=missing + problems,
+        )
     if problems:
         return _check("fail", "Checkpoint/metric traceability is incomplete.", problems=problems)
     return _check(
@@ -597,13 +641,16 @@ def _check_consistency(
     ensemble: Any | None,
     return_model: Any | None,
     capper: Any | None,
+    *,
+    require_dynamics: bool = True,
+    require_return: bool = True,
 ) -> dict[str, Any]:
     expected: dict[str, Any] = {}
     if manifest:
         expected["horizon"] = manifest.get("horizon")
         expected["reward_scale"] = manifest.get("reward_scale")
-    payload_horizon = (dynamics_payload or {}).get("horizon")
-    payload_scale = (dynamics_payload or {}).get("reward_scale")
+    payload_horizon = (dynamics_payload or {}).get("horizon") if require_dynamics else None
+    payload_scale = (dynamics_payload or {}).get("reward_scale") if require_dynamics else None
     if payload_horizon is not None:
         if expected.get("horizon") is not None and int(expected["horizon"]) != int(payload_horizon):
             return _check(
@@ -653,7 +700,7 @@ def _check_consistency(
                 expected_scale=float(expected["reward_scale"]),
             )
 
-    if return_payload:
+    if return_payload and require_return:
         for key in ("horizon", "scale"):
             if return_payload.get(key) is None:
                 continue
@@ -707,15 +754,29 @@ def check_pilot_readiness(
     return_payload = _torch_load_if_needed(
         return_payload, return_checkpoint, weights_only=weights_only, allow_unsafe_legacy=allow_unsafe_legacy
     )
+    requested = tuple(required_variants)
+    requires_return = _requires_return(requested)
+    requires_dynamics = _requires_dynamics(requested)
 
     checks = {
         "provenance": _check_provenance(manifest, dynamics_payload, dataset_path),
         "splits": _check_splits(manifest, dynamics_payload),
         "final_test_isolation": _check_test_isolation(manifest, dynamics_payload),
         "frozen_dt_parity": _check_parity(dt_parity),
-        "bootstrap": _check_bootstrap(dynamics_payload, manifest, ensemble),
+        "bootstrap": _check_bootstrap(
+            dynamics_payload,
+            manifest,
+            ensemble,
+            required=requires_dynamics,
+        ),
         "normalization": _check_normalization(
-            ensemble, dynamics_payload, return_model, return_payload
+            ensemble,
+            dynamics_payload,
+            return_model,
+            return_payload,
+            capper,
+            require_dynamics=requires_dynamics,
+            require_return=requires_return,
         ),
         "components": _check_components(
             capper,
@@ -723,13 +784,15 @@ def check_pilot_readiness(
             return_payload,
             ensemble,
             dynamics_payload,
-            required_variants,
+            requested,
         ),
         "traceability": _check_traceability(
             dynamics_checkpoint,
             return_checkpoint,
             dynamics_payload,
             return_payload,
+            require_dynamics=requires_dynamics,
+            require_return=requires_return,
         ),
         "consistency": _check_consistency(
             manifest,
@@ -738,6 +801,8 @@ def check_pilot_readiness(
             ensemble,
             return_model,
             capper,
+            require_dynamics=requires_dynamics,
+            require_return=requires_return,
         ),
     }
 
@@ -754,7 +819,7 @@ def check_pilot_readiness(
         "checks": checks,
         "blockers": blockers,
         "warnings": warnings,
-        "required_variants": list(required_variants),
+        "required_variants": list(requested),
     }
 
 

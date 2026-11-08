@@ -1,0 +1,93 @@
+{
+  "blockers": [
+    "bootstrap",
+    "normalization",
+    "components",
+    "traceability"
+  ],
+  "checks": {
+    "bootstrap": {
+      "detail": "Dynamics checkpoint not supplied; bootstrap metadata cannot be verified.",
+      "evidence": {},
+      "status": "blocked"
+    },
+    "components": {
+      "detail": "Required variants are unavailable because artifacts are missing: ['B4', 'B5']",
+      "evidence": {
+        "available_variants": [
+          "B0",
+          "B3"
+        ],
+        "has_r": true,
+        "has_u": false
+      },
+      "status": "blocked"
+    },
+    "consistency": {
+      "detail": "Horizon and reward scale agree across manifest, checkpoints, and components.",
+      "evidence": {
+        "horizon": 1000,
+        "reward_scale": 1000.0
+      },
+      "status": "pass"
+    },
+    "final_test_isolation": {
+      "detail": "No final-test split is present in the training artifacts.",
+      "evidence": {},
+      "status": "pass"
+    },
+    "frozen_dt_parity": {
+      "detail": "Frozen-DT parity passed against the real checkpoint.",
+      "evidence": {
+        "max_abs_difference": 0.0,
+        "tolerance": 1e-06
+      },
+      "status": "pass"
+    },
+    "normalization": {
+      "detail": "Dynamics checkpoint not supplied; normalization cannot be verified.",
+      "evidence": {},
+      "status": "blocked"
+    },
+    "provenance": {
+      "detail": "Dataset SHA-256 matches recorded provenance.",
+      "evidence": {
+        "actual_sha256": "6b5700ff2ce2ae01ea33ef5b448f66dc28be08d9add984e01d28637c05c76700",
+        "recorded_hashes": {
+          "manifest.dataset_sha256": "6b5700ff2ce2ae01ea33ef5b448f66dc28be08d9add984e01d28637c05c76700",
+          "manifest.source_sha256": "5bdf1bc4a713c82941de44633df669b36c89850b652a25985166796d25cf71a0"
+        }
+      },
+      "status": "pass"
+    },
+    "splits": {
+      "detail": "Train/validation episodes are disjoint and the split seed is recorded.",
+      "evidence": {
+        "seed": 0,
+        "train_episodes": 1966,
+        "validation_episodes": 219
+      },
+      "status": "pass"
+    },
+    "traceability": {
+      "detail": "Required checkpoints are missing; traceability cannot be verified.",
+      "evidence": {
+        "problems": [
+          "dynamics checkpoint path not supplied",
+          "dynamics checkpoint has no per-head metrics",
+          "dynamics metrics missing base_seed",
+          "dynamics metrics missing training_config"
+        ]
+      },
+      "status": "blocked"
+    }
+  },
+  "ready": false,
+  "required_variants": [
+    "B0",
+    "B3",
+    "B4",
+    "B5"
+  ],
+  "warnings": []
+}

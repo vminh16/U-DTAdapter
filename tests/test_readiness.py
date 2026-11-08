@@ -234,7 +234,7 @@ def test_missing_return_component_blocks_b3_and_b5(tmp_path):
         dt_parity=artifacts["dt_parity"],
         required_variants=("B0", "B3", "B5"),
     )
-    assert report["checks"]["components"]["status"] == "fail"
+    assert report["checks"]["components"]["status"] == "blocked"
     assert not report["ready"]
 
 
@@ -247,7 +247,7 @@ def test_missing_dynamics_blocks_b4(tmp_path):
         dt_parity=artifacts["dt_parity"],
         required_variants=("B0", "B4"),
     )
-    assert report["checks"]["components"]["status"] == "fail"
+    assert report["checks"]["components"]["status"] == "blocked"
 
 
 def test_single_dynamics_head_warns_about_disagreement(tmp_path):
@@ -277,14 +277,14 @@ def test_horizon_mismatch_fails_consistency(tmp_path):
     assert report["checks"]["consistency"]["status"] == "fail"
 
 
-def test_missing_checkpoint_fails_without_crashing(tmp_path):
+def test_missing_checkpoint_blocks_without_crashing(tmp_path):
     artifacts = _make_artifacts(tmp_path)
     report = _run(
         artifacts,
         dynamics_checkpoint=tmp_path / "missing.pt",
         dynamics_payload=None,
     )
-    assert report["checks"]["traceability"]["status"] == "fail"
+    assert report["checks"]["traceability"]["status"] == "blocked"
     problems = report["checks"]["traceability"]["evidence"]["problems"]
     assert any("dynamics" in problem for problem in problems)
 

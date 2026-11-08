@@ -5,14 +5,9 @@ Reuses the official baseline SequenceTrainer via `udt.dt_integration.train_decis
 """
 
 import argparse
-from pathlib import Path
-import sys
 import time
-import torch
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR / "src") not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR / "src"))
+import torch
 
 from udt.dt_integration import train_decision_transformer
 
@@ -40,9 +35,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def main() -> int:
     args = parse_args()
-
+    if args.num_steps <= 0:
+        raise ValueError(f"num_steps must be positive, got {args.num_steps}")
+    if args.k <= 0:
+        raise ValueError(f"k must be positive, got {args.k}")
     print(f"Training Decision Transformer using baseline SequenceTrainer...")
     print(f"Data: {args.data} | Manifest: {args.manifest} | Output: {args.output}")
     print(f"Steps: {args.num_steps} | Batch: {args.batch_size} | K: {args.k} | Device: {args.device}")
@@ -74,7 +72,8 @@ def main() -> None:
     if summary.get("best_val_loss") is not None and summary["best_val_loss"] < float("inf"):
         print(f"Best Val MSE:       {summary['best_val_loss']:.5f} (step {summary.get('best_step')})")
     print(f"Checkpoint saved to: {args.output}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

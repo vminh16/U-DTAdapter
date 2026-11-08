@@ -80,7 +80,7 @@ python scripts/train_dt.py \
 
 ### Bước 3.2. Chạy đánh giá Closed-Loop Baseline B0 & Kiểm tra Parity
 
-Script `scripts/evaluate_b0.py` thực hiện chu trình kiểm định khép kín:
+Script `scripts/evaluate.py --variant B0` thực hiện chu trình kiểm định khép kín:
 1. **Kiểm tra đóng băng**: Xác thực toàn bộ tham số của mô hình có `requires_grad == False` và ở chế độ `eval()`.
 2. **Kiểm tra Parity**: So sánh trực tiếp hành động suy luận của `DTAdapter` với mô hình gốc để đảm bảo không bị lệch chuẩn (`max_abs_difference <= 1e-6`). Xuất báo cáo ra `checkpoints/decision_transformer/parity.json`.
 3. **Rollout đa episode**: Chạy $N$ episodes trong môi trường MuJoCo `Hopper-v4` thông qua hàm đánh giá `evaluate_with_budget` (với Return Capper = None, không rerank).
@@ -88,22 +88,28 @@ Script `scripts/evaluate_b0.py` thực hiện chu trình kiểm định khép k�
 
 **Lệnh chạy đánh giá với Target Return $G_0 = 1800.0$ (Phân vị ~90% của tập Hopper-medium):**
 ```bash
-python scripts/evaluate_b0.py \
+python scripts/evaluate.py \
+  --variant B0 \
   --checkpoint checkpoints/decision_transformer/model.pt \
   --env Hopper-v4 \
   --target-return 1800.0 \
   --episodes 10 \
   --horizon 1000 \
+  --parity-output results/b0_parity.json \
+  --results-output results/b0_evaluation.json \
   --device cuda
 ```
 
 **Thử nghiệm với Target Return cao $G_0 = 3600.0$ (để quan sát hiện tượng suy thoái/drift của DT gốc):**
 ```bash
-python scripts/evaluate_b0.py \
+python scripts/evaluate.py \
+  --variant B0 \
   --checkpoint checkpoints/decision_transformer/model.pt \
   --env Hopper-v4 \
   --target-return 3600.0 \
   --episodes 10 \
+  --horizon 1000 \
+  --parity-output results/b0_parity_high_target.json \
   --results-output results/b0_evaluation_high_target.json \
   --device cuda
 ```
@@ -112,14 +118,14 @@ python scripts/evaluate_b0.py \
 
 ### Bước 3.3. Kiểm tra Trạng thái Sẵn sàng (Pilot Readiness Audit)
 
-Sau khi chạy xong bước đánh giá, file `checkpoints/decision_transformer/parity.json` đã được tạo với kết quả xác thực. Bạn có thể kiểm tra trạng thái readiness của hệ thống:
+Sau khi chạy xong bước đánh giá, file `results/b0_parity.json` đã được tạo với kết quả xác thực. Bạn có thể kiểm tra trạng thái readiness của hệ thống:
 
 ```bash
-udt readiness \
+python scripts/check_readiness.py \
   --manifest data/prepared/hopper-medium-v2/manifest.json \
   --dataset data/prepared/hopper-medium-v2/dataset.npz \
   --return-checkpoint checkpoints/module_r/return_capper.pt \
-  --parity checkpoints/decision_transformer/parity.json \
+  --parity results/b0_parity.json \
   --variants B0,B3
 ```
 
@@ -132,5 +138,5 @@ Chỉ số `[PASS] frozen_dt_parity: Frozen-DT parity passed against the real ch
 | Đường dẫn | Mô tả |
 | :--- | :--- |
 | `checkpoints/decision_transformer/model.pt` | Checkpoint mô hình Decision Transformer đã đóng băng trọng số |
-| `checkpoints/decision_transformer/parity.json` | Báo cáo kiểm định sai số giữa DT gốc và DTAdapter (`passed: true`) |
+| `results/b0_parity.json` | Báo cáo kiểm định sai số giữa DT gốc và DTAdapter (`passed: true`) |
 | `results/b0_evaluation.json` | Kết quả phân phối return, độ dài và trạng thái từng episode của Baseline B0 |

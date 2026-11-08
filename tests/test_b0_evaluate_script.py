@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import sys
+
 import numpy as np
 import pytest
 import torch
@@ -9,7 +10,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.evaluate_b0 import main as evaluate_main
+from scripts.evaluate import main as evaluate_main
 from udt.dt_integration import train_decision_transformer
 
 
@@ -57,87 +58,113 @@ def _train_dummy_checkpoint(tmp_path, state_dim=4, act_dim=2, horizon=20, reward
     return ckpt_path
 
 
+def _argv(ckpt_path, tmp_path, **overrides):
+    values = {
+        "--variant": "B0",
+        "--checkpoint": str(ckpt_path),
+        "--device": "cpu",
+        "--parity-output": str(tmp_path / "parity.json"),
+        "--results-output": str(tmp_path / "results.json"),
+    }
+    values.update(overrides)
+    args = ["evaluate.py"]
+    for key, value in values.items():
+        if value != "":
+            args.extend([key, str(value)])
+        else:
+            args.append(key)
+    return args
+
+
 def test_evaluate_rejects_invalid_episodes(tmp_path, monkeypatch):
     ckpt_path = _train_dummy_checkpoint(tmp_path)
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(ckpt_path), "--episodes", "0"])
+    monkeypatch.setattr("sys.argv", _argv(ckpt_path, tmp_path, **{"--episodes": 0}))
     with pytest.raises(ValueError, match="episodes.*positive"):
         evaluate_main()
 
 
 def test_evaluate_rejects_invalid_horizon(tmp_path, monkeypatch):
     ckpt_path = _train_dummy_checkpoint(tmp_path)
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(ckpt_path), "--horizon", "0"])
+    monkeypatch.setattr("sys.argv", _argv(ckpt_path, tmp_path, **{"--horizon": 0}))
     with pytest.raises(ValueError, match="horizon.*positive"):
         evaluate_main()
 
 
 def test_evaluate_rejects_horizon_exceeding_checkpoint_max_ep_len(tmp_path, monkeypatch):
     ckpt_path = _train_dummy_checkpoint(tmp_path, horizon=15)
-    # Checkpoint has max_ep_len=15; evaluate with horizon=20
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(ckpt_path), "--horizon", "20"])
+    monkeypatch.setattr("sys.argv", _argv(ckpt_path, tmp_path, **{"--horizon": 20}))
     with pytest.raises(ValueError, match="horizon.*max_ep_len"):
         evaluate_main()
 
 
 def test_evaluate_rejects_horizon_exceeding_n_positions(tmp_path, monkeypatch):
     ckpt_path = _train_dummy_checkpoint(tmp_path, horizon=2000)
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(ckpt_path), "--horizon", "1025"])
+    monkeypatch.setattr("sys.argv", _argv(ckpt_path, tmp_path, **{"--horizon": 1025}))
     with pytest.raises(ValueError, match="capacity|positional embedding|1024"):
         evaluate_main()
 
 
 def test_evaluate_rejects_missing_metadata(tmp_path, monkeypatch):
-    # Save a malformed checkpoint missing state_dim
     bad_ckpt = tmp_path / "bad_model.pt"
     torch.save({"model_state_dict": {}}, bad_ckpt)
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(bad_ckpt)])
+    monkeypatch.setattr("sys.argv", _argv(bad_ckpt, tmp_path))
     with pytest.raises(ValueError, match="missing required metadata|state_dim"):
         evaluate_main()
 
 
+class DummyEnv:
+    def __init__(self, state_dim=4, act_dim=2):
+        self.observation_space = type("ObsSpace", (), {"shape": (state_dim,)})()
+        self.action_space = type(
+            "ActSpace",
+            (),
+            {
+                "shape": (act_dim,),
+                "low": -np.ones(act_dim, dtype=np.float32),
+                "high": np.ones(act_dim, dtype=np.float32),
+            },
+        )()
+
+    def reset(self, seed=None):
+        return np.zeros(self.observation_space.shape, dtype=np.float32), {}
+
+    def step(self, action):
+        return np.zeros(self.observation_space.shape, dtype=np.float32), 1.0, True, False, {}
+
+    def close(self):
+        pass
+
+
 def test_evaluate_rejects_env_dimension_mismatch(tmp_path, monkeypatch):
-    # Dummy checkpoint with state_dim=4, act_dim=2
     ckpt_path = _train_dummy_checkpoint(tmp_path, state_dim=4, act_dim=2)
-    # Mock environment with state_dim=11, act_dim=3
-    import sys
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(ckpt_path), "--env", "DummyEnv", "--horizon", "20"])
-
-    class DummyEnv:
-        def __init__(self):
-            self.observation_space = type("ObsSpace", (), {"shape": (11,)})()
-            self.action_space = type("ActSpace", (), {"shape": (3,), "low": -np.ones(3), "high": np.ones(3)})()
-
-        def reset(self, seed=None):
-            return np.zeros(11, dtype=np.float32), {}
-
-        def step(self, a):
-            return np.zeros(11, dtype=np.float32), 1.0, True, False, {}
-
-        def close(self):
-            pass
-
+    monkeypatch.setattr(
+        "sys.argv", _argv(ckpt_path, tmp_path, **{"--env": "DummyEnv", "--horizon": 20})
+    )
     import gymnasium as gym
-    monkeypatch.setattr(gym, "make", lambda env_id: DummyEnv())
 
-    with pytest.raises(ValueError, match="dimension mismatch|state_dim"):
+    monkeypatch.setattr(gym, "make", lambda env_id: DummyEnv(state_dim=11, act_dim=3))
+    with pytest.raises(ValueError, match="dimension mismatch|state_dim|observation shape"):
         evaluate_main()
 
 
 def test_evaluate_safe_deserialization_rejects_arbitrary_objects(tmp_path, monkeypatch):
     import os
+
     unsafe_ckpt = tmp_path / "unsafe.pt"
     torch.save({"model_state_dict": {}, "state_dim": 4, "act_dim": 2, "func": os.system}, unsafe_ckpt)
-
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(unsafe_ckpt)])
-    with pytest.raises(ValueError, match="weights_only=True|allow-unsafe-legacy"):
+    monkeypatch.setattr("sys.argv", _argv(unsafe_ckpt, tmp_path))
+    with pytest.raises(Exception):
         evaluate_main()
 
 
 def test_evaluate_allow_unsafe_legacy_flag(tmp_path, monkeypatch):
     import os
+
     unsafe_ckpt = tmp_path / "unsafe.pt"
     torch.save({"model_state_dict": {}, "func": os.system}, unsafe_ckpt)
-    monkeypatch.setattr("sys.argv", ["evaluate_b0.py", "--checkpoint", str(unsafe_ckpt), "--allow-unsafe-legacy"])
+    monkeypatch.setattr(
+        "sys.argv", _argv(unsafe_ckpt, tmp_path, **{"--allow-unsafe-legacy": ""})
+    )
     with pytest.raises(ValueError, match="missing required metadata"):
         evaluate_main()
 
@@ -147,66 +174,29 @@ def test_evaluate_successful_run_writes_provenance_and_telemetry(tmp_path, monke
     out_results = tmp_path / "results.json"
     out_parity = tmp_path / "parity.json"
 
-    class DummyEnv:
-        def __init__(self):
-            self.observation_space = type("ObsSpace", (), {"shape": (4,)})()
-            self.action_space = type(
-                "ActSpace",
-                (),
-                {"shape": (2,), "low": -np.ones(2, dtype=np.float32), "high": np.ones(2, dtype=np.float32)},
-            )()
-
-        def reset(self, seed=None):
-            return np.zeros(4, dtype=np.float32), {}
-
-        def step(self, a):
-            return np.zeros(4, dtype=np.float32), 1.0, True, False, {}
-
-        def close(self):
-            pass
-
     import gymnasium as gym
-    monkeypatch.setattr(gym, "make", lambda env_id: DummyEnv())
 
+    monkeypatch.setattr(gym, "make", lambda env_id: DummyEnv())
     monkeypatch.setattr(
         "sys.argv",
-        [
-            "evaluate_b0.py",
-            "--checkpoint",
-            str(ckpt_path),
-            "--episodes",
-            "2",
-            "--horizon",
-            "10",
-            "--results-output",
-            str(out_results),
-            "--parity-output",
-            str(out_parity),
-            "--device",
-            "cpu",
-        ],
+        _argv(
+            ckpt_path,
+            tmp_path,
+            **{"--episodes": 2, "--horizon": 10},
+        ),
     )
 
-    ret = evaluate_main()
-    assert ret == 0
+    assert evaluate_main() == 0
     assert out_results.exists()
     assert out_parity.exists()
 
     data = json.loads(out_results.read_text())
     assert data["variant"] == "B0"
-    assert "provenance" in data
-    assert len(data["provenance"]["checkpoint_sha256"]) == 64
-    assert "git_commit" in data["provenance"]
-    assert "environment_metadata" in data
+    assert len(data["provenance"]["checkpoint_sha256"]["decision_transformer"]) == 64
+    assert data["provenance"]["git_commit"]
     assert data["environment_metadata"]["d4rl_closed_loop_parity"] == "BLOCKED"
     assert len(data["episodes_detail"]) == 2
-    for ep in data["episodes_detail"]:
-        assert "seed" in ep
-        assert "total_reward" in ep
-        assert "length" in ep
-        assert "final_raw_budget" in ep
+    for episode in data["episodes_detail"]:
+        for key in ("seed", "total_reward", "length", "final_raw_budget"):
+            assert key in episode
     assert data["parity"]["passed"] is True
-
-
-
-

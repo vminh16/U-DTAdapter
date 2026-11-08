@@ -5,11 +5,14 @@ Unknown starts, collection cuts and discontinuities never become complete episod
 """
 
 from collections import Counter
+import json
 from pathlib import Path
 from typing import Any
 
 import h5py
 import numpy as np
+
+from udt.provenance import compute_file_sha256
 
 
 MANDATORY_FIELDS = ('observations', 'actions', 'rewards', 'terminals')
@@ -136,6 +139,133 @@ def load_dataset(path: str | Path) -> dict[str, np.ndarray]:
         raise ValueError(f"Unsupported dataset format: {suffix}. Expected .hdf5, .h5, or .npz")
 
     return data
+
+
+def load_prepared_dataset(
+    path: str | Path,
+    *,
+    horizon: int | None = None,
+    reward_scale: float | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Load prepared arrays plus the sibling manifest and check shared settings."""
+    data_path = Path(path)
+    dataset = load_dataset(data_path)
+    manifest_path = data_path.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+
+    if horizon is not None and manifest.get("horizon") is not None:
+        if int(manifest["horizon"]) != int(horizon):
+            raise ValueError(
+                f"Horizon mismatch: manifest horizon ({manifest['horizon']}) != requested horizon ({horizon})"
+            )
+    if reward_scale is not None and manifest.get("reward_scale") is not None:
+        if not np.isclose(float(manifest["reward_scale"]), float(reward_scale)):
+            raise ValueError(
+                "Reward scale mismatch: manifest reward_scale "
+                f"({manifest['reward_scale']}) != requested reward_scale ({reward_scale})"
+            )
+    return dataset, manifest
+
+
+def verify_manifest_normalization(
+    dataset: dict[str, np.ndarray],
+    manifest: dict[str, Any],
+    *,
+    atol: float = 1e-5,
+) -> dict[str, Any]:
+    """Prove that manifest normalization statistics came from the training split."""
+    mean = manifest.get("state_mean")
+    std = manifest.get("state_std")
+    if mean is None or std is None:
+        raise ValueError("Manifest is missing state_mean/state_std")
+    if "is_validation" not in dataset or "observations" not in dataset:
+        raise ValueError("Dataset must contain observations and is_validation")
+
+    train_obs = np.asarray(dataset["observations"])[~np.asarray(dataset["is_validation"])]
+    if len(train_obs) == 0:
+        raise ValueError("Training split is empty; cannot verify normalization")
+    expected_mean = train_obs.mean(axis=0, dtype=np.float64)
+    expected_std = np.maximum(train_obs.std(axis=0, dtype=np.float64), 1e-6)
+    mean = np.asarray(mean, dtype=np.float64)
+    std = np.asarray(std, dtype=np.float64)
+    if mean.shape != expected_mean.shape or std.shape != expected_std.shape:
+        raise ValueError("Manifest normalization shape does not match observations")
+    if not np.allclose(mean, expected_mean, rtol=0, atol=atol):
+        raise ValueError("Manifest state_mean does not match the training split")
+    if not np.allclose(std, expected_std, rtol=0, atol=atol):
+        raise ValueError("Manifest state_std does not match the training split")
+    return {
+        "source": "prepared_manifest_train_split",
+        "verified": True,
+        "atol": atol,
+    }
+
+
+def audit_dataset_file(
+    path: str | Path,
+    *,
+    horizon: int,
+    starts_at_reset: bool = False,
+    timeout_semantics: str = "unknown",
+    dataset_id: str = "unspecified",
+    continuity_atol: float = 1e-6,
+) -> dict[str, Any]:
+    """Audit a raw dataset file and attach source provenance."""
+    data_path = Path(path)
+    report = audit_dataset(
+        load_dataset(data_path),
+        horizon=horizon,
+        starts_at_reset=starts_at_reset,
+        timeout_semantics=timeout_semantics,
+        continuity_atol=continuity_atol,
+    )
+    report["provenance"] = {
+        "dataset_id": dataset_id,
+        "source_sha256": compute_file_sha256(data_path),
+    }
+    return report
+
+
+def prepare_dataset_file(
+    input_path: str | Path,
+    output_dir: str | Path,
+    *,
+    horizon: int,
+    starts_at_reset: bool = False,
+    timeout_semantics: str = "unknown",
+    seed: int = 0,
+    validation_fraction: float = 0.1,
+    reward_scale: float = 1000.0,
+    dataset_id: str = "unspecified",
+    continuity_atol: float = 1e-6,
+) -> dict[str, Any]:
+    """Prepare, verify, and persist a dataset without overwriting an existing one."""
+    source = Path(input_path)
+    target = Path(output_dir)
+    if target.exists() and any(target.iterdir()):
+        raise FileExistsError(f"Output directory {target} already exists and is not empty.")
+
+    arrays, manifest = prepare_dataset(
+        load_dataset(source),
+        horizon=horizon,
+        starts_at_reset=starts_at_reset,
+        timeout_semantics=timeout_semantics,
+        seed=seed,
+        validation_fraction=validation_fraction,
+        reward_scale=reward_scale,
+        continuity_atol=continuity_atol,
+    )
+    manifest["dataset_id"] = dataset_id
+    manifest["provenance"] = {
+        "command": ["prepare", str(source)],
+        "source_sha256": compute_file_sha256(source),
+    }
+
+    target.mkdir(parents=True, exist_ok=True)
+    np.savez(target / "dataset.npz", **arrays)
+    manifest["provenance"]["dataset_sha256"] = compute_file_sha256(target / "dataset.npz")
+    (target / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return manifest
 
 
 def audit_dataset(data: dict[str, np.ndarray], *, horizon: int,

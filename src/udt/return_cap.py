@@ -9,6 +9,7 @@ Provides:
 - train_return_cap: Complete training pipeline for expectile return models.
 """
 
+from pathlib import Path
 from typing import Any, Literal
 import copy
 import numpy as np
@@ -16,6 +17,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from udt.checkpoint import load_checkpoint_payload
 from udt.intervention import ReturnBudget
 
 
@@ -587,6 +589,9 @@ def train_return_cap(
         train_obs_raw = dataset["observations"][train_mask]
         state_mean = np.mean(train_obs_raw, axis=0, dtype=np.float32)
         state_std = np.maximum(np.std(train_obs_raw, axis=0, dtype=np.float32), 1e-6)
+        norm_provenance = {"source": "return_training_split", "verified": True}
+    else:
+        norm_provenance = {"source": "external_unverified", "verified": False}
 
     # Normalize observations
     train_obs = ((dataset["observations"][train_mask] - state_mean) / state_std).astype(np.float32)
@@ -736,5 +741,209 @@ def train_return_cap(
         "best_val_coverage": best_val_coverage,
         "best_epoch": best_epoch,
         "restored_checkpoint_evaluation": independent,
+        "normalization_provenance": norm_provenance,
     }
     return capper, metrics
+
+
+def _return_architecture(payload: dict[str, Any]) -> dict[str, Any]:
+    """Read architecture fields, inferring them for legacy neural checkpoints."""
+    mode = payload.get("mode")
+    state_dict = payload.get("model_state_dict")
+    if mode == "global" or state_dict is None:
+        if payload.get("cap_value") is None:
+            raise ValueError("Return checkpoint has neither model_state_dict nor cap_value")
+        return {"mode": "global", "state_dim": None, "hidden_dim": None, "num_layers": None}
+
+    if mode not in ("state_time", "time_only", "state_only"):
+        raise ValueError(f"Unsupported return-model mode: {mode!r}")
+
+    if all(key in payload for key in ("state_dim", "hidden_dim", "num_layers")):
+        architecture = {
+            "mode": mode,
+            "state_dim": int(payload["state_dim"]),
+            "hidden_dim": int(payload["hidden_dim"]),
+            "num_layers": int(payload["num_layers"]),
+        }
+    else:
+        # Legacy checkpoint: recover the MLP shape from its state dict.
+        linear_weights = {
+            int(key.split(".")[1]): value
+            for key, value in state_dict.items()
+            if key.startswith("network.") and key.endswith(".weight") and value.ndim == 2
+        }
+        if not linear_weights:
+            raise ValueError("Legacy return checkpoint has no reconstructable MLP layers")
+        ordered = [linear_weights[index] for index in sorted(linear_weights)]
+        state_mean = payload.get("state_mean")
+        if state_mean is None:
+            raise ValueError(
+                "Legacy return checkpoint is missing state_mean; cannot infer state_dim"
+            )
+        architecture = {
+            "mode": mode,
+            "state_dim": int(np.asarray(state_mean).shape[0]),
+            "hidden_dim": int(ordered[0].shape[0]),
+            "num_layers": len(ordered),
+        }
+
+    expected_input = {
+        "state_time": architecture["state_dim"] + 1,
+        "time_only": 1,
+        "state_only": architecture["state_dim"],
+    }[mode]
+    actual_input = int(ordered[0].shape[1]) if "ordered" in locals() else None
+    if actual_input is not None and actual_input != expected_input:
+        raise ValueError(
+            f"Return checkpoint input dimension {actual_input} is incompatible with "
+            f"mode {mode!r} and state_dim {architecture['state_dim']}"
+        )
+    if architecture["num_layers"] < 2:
+        raise ValueError("Return checkpoint must contain at least two linear layers")
+    return architecture
+
+
+def save_return_capper(
+    path: str | Path,
+    capper: ReturnCapper,
+    *,
+    metrics: dict[str, Any] | None = None,
+    seed: int | None = None,
+    tau: float | None = None,
+    training_config: dict[str, Any] | None = None,
+    dataset_provenance: dict[str, Any] | None = None,
+) -> Path:
+    """Save Module R weights plus the configuration needed to rebuild them."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    metrics = metrics or {}
+
+    if isinstance(capper.model, GlobalReturnCap):
+        architecture = {"mode": "global", "state_dim": None, "hidden_dim": None, "num_layers": None}
+        model_state_dict = None
+        cap_value = float(capper.model.cap_value)
+        norm_provenance = {"source": "not_applicable", "verified": True}
+    elif isinstance(capper.model, ReturnCapMLP):
+        architecture = {
+            "mode": capper.model.mode,
+            "state_dim": int(capper.model.state_dim),
+            "hidden_dim": int(capper.model.hidden_dim),
+            "num_layers": sum(1 for layer in capper.model.network if isinstance(layer, nn.Linear)),
+        }
+        model_state_dict = capper.model.state_dict()
+        cap_value = None
+        norm_provenance = metrics.get("normalization_provenance") or {
+            "source": "unknown",
+            "verified": False,
+        }
+    else:
+        raise ValueError(f"Unsupported return-capper model type: {type(capper.model)!r}")
+
+    payload = {
+        "format_version": 1,
+        "kind": "udt_return_capper",
+        "architecture": architecture,
+        "mode": architecture["mode"],
+        "state_dim": architecture["state_dim"],
+        "hidden_dim": architecture["hidden_dim"],
+        "num_layers": architecture["num_layers"],
+        "horizon": int(capper.horizon),
+        "tau": tau,
+        "margin": float(capper.margin),
+        "scale": float(capper.scale),
+        "seed": seed,
+        "state_mean": None if capper.state_mean is None else np.asarray(capper.state_mean).tolist(),
+        "state_std": None if capper.state_std is None else np.asarray(capper.state_std).tolist(),
+        "normalization_provenance": norm_provenance,
+        "training_config": training_config,
+        "dataset_provenance": dataset_provenance,
+        "metrics": metrics,
+        "model_state_dict": model_state_dict,
+        "cap_value": cap_value,
+    }
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(target)
+    return target
+
+
+def load_return_capper(
+    path: str | Path,
+    *,
+    device: str | torch.device = "cpu",
+    expected_horizon: int | None = None,
+    expected_scale: float | None = None,
+    expected_state_dim: int | None = None,
+    weights_only: bool = True,
+    allow_unsafe_legacy: bool = False,
+) -> tuple[ReturnCapper, dict[str, Any]]:
+    """Load Module R and reject incompatible configurations.
+
+    Supports new ``.pt`` checkpoints, legacy neural ``.pt`` checkpoints, and the
+    legacy global ``.json`` baseline. Legacy architectures are inferred from the
+    saved state dict; anything that cannot be reconstructed fails loudly.
+    """
+    payload = load_checkpoint_payload(
+        path,
+        weights_only=weights_only,
+        allow_unsafe_legacy=allow_unsafe_legacy,
+    )
+    if payload.get("kind") not in (None, "udt_return_capper"):
+        raise ValueError(f"{path} is not a U-DT return-capper checkpoint")
+    if payload.get("format_version") not in (None, 1):
+        raise ValueError(
+            f"Unsupported return checkpoint format_version={payload.get('format_version')}"
+        )
+
+    architecture = _return_architecture(payload)
+    horizon = payload.get("horizon")
+    scale = payload.get("scale")
+    if horizon is None or scale is None:
+        raise ValueError("Return checkpoint is missing horizon or scale")
+
+    checks = {
+        "horizon": (int(horizon), expected_horizon),
+        "scale": (float(scale), expected_scale),
+        "state_dim": (architecture["state_dim"], expected_state_dim),
+    }
+    for name, (actual, expected) in checks.items():
+        if expected is None or actual is None:
+            continue
+        if name == "scale":
+            if not np.isclose(actual, float(expected)):
+                raise ValueError(
+                    f"Checkpoint {name} ({actual}) is incompatible with expected configuration ({expected})"
+                )
+        elif int(actual) != int(expected):
+            raise ValueError(
+                f"Checkpoint {name} ({actual}) is incompatible with expected configuration ({expected})"
+            )
+
+    state_mean = payload.get("state_mean")
+    state_std = payload.get("state_std")
+    if architecture["mode"] == "global":
+        model: nn.Module | GlobalReturnCap = GlobalReturnCap(float(payload["cap_value"]))
+        state_mean = None
+        state_std = None
+    else:
+        if state_mean is None or state_std is None:
+            raise ValueError("Return checkpoint is missing normalization statistics")
+        model = ReturnCapMLP(
+            state_dim=architecture["state_dim"],
+            hidden_dim=architecture["hidden_dim"],
+            num_layers=architecture["num_layers"],
+            mode=architecture["mode"],
+        )
+        model.load_state_dict(payload["model_state_dict"])
+        model.eval()
+
+    capper = ReturnCapper(
+        model=model,
+        horizon=int(horizon),
+        margin=float(payload.get("margin", 0.0)),
+        scale=float(scale),
+        state_mean=state_mean,
+        state_std=state_std,
+        device=str(device),
+    )
+    return capper, payload

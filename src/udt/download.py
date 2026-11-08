@@ -10,6 +10,8 @@ import json
 import urllib.request
 import h5py
 
+from udt.provenance import compute_file_sha256
+
 
 D4RL_URLS: dict[str, str] = {
     # Hopper
@@ -30,13 +32,9 @@ D4RL_URLS: dict[str, str] = {
 REQUIRED_DATASET_FIELDS = ("observations", "actions", "rewards", "terminals")
 
 
-def compute_sha256(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
-    """Compute the SHA-256 digest of a file."""
-    hasher = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(chunk_size):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+def compute_sha256(path: str | Path) -> str:
+    """Backward-compatible alias for the shared provenance hash."""
+    return compute_file_sha256(path)
 
 
 def validate_dataset_file(path: str | Path) -> dict:
@@ -159,7 +157,7 @@ def download_dataset(
             except ValueError:
                 cache_valid = False
         if cache_valid:
-            cache_hash = compute_sha256(dest_file, chunk_size)
+            cache_hash = compute_sha256(dest_file)
             if expected_sha256 is None or cache_hash.lower() == expected_sha256.lower():
                 if provenance_path is not None:
                     _write_provenance(

@@ -1,6 +1,7 @@
 """Closed-loop entrypoints for the B0/B3/B4/B5 pilot variants."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -8,6 +9,8 @@ import numpy as np
 from udt.dt_adapter import DTAdapter
 from udt.dynamics import DynamicsEnsemble, ModuleUController
 from udt.evaluation import RolloutResult, evaluate_with_budget
+from udt.profiling import environment_metadata
+from udt.provenance import compute_file_sha256, dataset_provenance, git_commit_sha
 from udt.return_cap import ReturnCapper
 
 
@@ -167,3 +170,172 @@ def run_variant(
         strict_env_seed=strict_env_seed,
     )
     return VariantRun(variant=variant, rollout=rollout)
+
+
+def evaluate_variant(
+    variant: str,
+    env: Any,
+    dt_adapter: DTAdapter,
+    *,
+    episodes: int,
+    seed: int = 0,
+    capper: ReturnCapper | None = None,
+    ensemble: DynamicsEnsemble | None = None,
+    return_model: ReturnCapper | None = None,
+    num_candidates: int = 10,
+    radius: float = 0.05,
+    beta: float = 0.1,
+    horizon: int = 1000,
+    initial_target: float = 1000.0,
+    reward_scale: float = 1000.0,
+    obs_noise_scale: float = 0.0,
+    act_noise_scale: float = 0.0,
+    state_std: np.ndarray | None = None,
+    action_low: np.ndarray | None = None,
+    action_high: np.ndarray | None = None,
+    strict_env_seed: bool = False,
+    collect_diagnostics: bool = False,
+) -> dict[str, Any]:
+    """Run the canonical multi-episode evaluation loop for one variant."""
+    if not isinstance(episodes, (int, np.integer)) or episodes <= 0:
+        raise ValueError(f"episodes must be a positive integer, got {episodes}")
+
+    episode_records: list[dict[str, Any]] = []
+    returns: list[float] = []
+    lengths: list[int] = []
+
+    for episode in range(1, int(episodes) + 1):
+        episode_seed = int(seed) + episode
+        run = run_variant(
+            variant,
+            env,
+            dt_adapter,
+            capper=capper,
+            ensemble=ensemble,
+            return_model=return_model,
+            num_candidates=num_candidates,
+            radius=radius,
+            beta=beta,
+            horizon=horizon,
+            initial_target=initial_target,
+            reward_scale=reward_scale,
+            seed=episode_seed,
+            obs_noise_scale=obs_noise_scale,
+            act_noise_scale=act_noise_scale,
+            state_std=state_std,
+            action_low=action_low,
+            action_high=action_high,
+            strict_env_seed=strict_env_seed,
+        )
+        rollout = run.rollout
+        infos = rollout.policy_infos
+        selected_indices = [
+            info["selected_index"] for info in infos if "selected_index" in info
+        ]
+        disagreements = [
+            float(np.mean(info["disagreements"]))
+            for info in infos
+            if info.get("disagreements") is not None
+        ]
+        record: dict[str, Any] = {
+            "episode": episode,
+            "seed": episode_seed,
+            "total_reward": float(rollout.total_reward),
+            "length": int(rollout.length),
+            "terminated": bool(rollout.terminated),
+            "truncated": bool(rollout.truncated),
+            "final_raw_budget": float(rollout.final_raw_budget),
+            "clipping_frequency": float(rollout.clipping_frequency),
+            "intervention_frequency": (
+                float(np.mean([index != 0 for index in selected_indices]))
+                if selected_indices
+                else 0.0
+            ),
+            "mean_disagreement": float(np.mean(disagreements)) if disagreements else None,
+            "rtg_raw": list(rollout.raw_budgets) if collect_diagnostics else [],
+            "rtg_token": list(rollout.tokens_used) if collect_diagnostics else [],
+            "caps": list(rollout.caps) if collect_diagnostics else [],
+            "selected_candidates": selected_indices if collect_diagnostics else [],
+            "warnings": list(rollout.warnings),
+        }
+        episode_records.append(record)
+        returns.append(record["total_reward"])
+        lengths.append(record["length"])
+
+    returns_array = np.asarray(returns, dtype=np.float64)
+    lengths_array = np.asarray(lengths, dtype=np.float64)
+    terminated = sum(record["terminated"] for record in episode_records)
+    truncated = sum(record["truncated"] for record in episode_records)
+    return {
+        "variant": variant,
+        "episodes": int(episodes),
+        "seed": int(seed),
+        "target_return": float(initial_target),
+        "reward_scale": float(reward_scale),
+        "horizon": int(horizon),
+        "mean_return": float(returns_array.mean()),
+        "std_return": float(returns_array.std()),
+        "median_return": float(np.median(returns_array)),
+        "min_return": float(returns_array.min()),
+        "max_return": float(returns_array.max()),
+        "mean_length": float(lengths_array.mean()),
+        "raw_episode_returns": returns,
+        "episode_lengths": lengths,
+        "termination_reasons": {
+            "terminated": int(terminated),
+            "truncated": int(truncated),
+            "other": int(len(episode_records) - terminated - truncated),
+        },
+        "episodes_detail": episode_records,
+    }
+
+
+def build_evaluation_report(
+    *,
+    variant: str,
+    env_id: str,
+    summary: dict[str, Any],
+    config: dict[str, Any],
+    checkpoints: dict[str, str | Path | None],
+    dataset_path: str | Path | None = None,
+    dataset_manifest: dict[str, Any] | None = None,
+    parity: dict[str, Any] | None = None,
+    device: str = "cpu",
+) -> dict[str, Any]:
+    """Attach one reproducible provenance schema to any variant's results."""
+    checkpoint_hashes = {
+        name: compute_file_sha256(path)
+        for name, path in checkpoints.items()
+        if path is not None and Path(path).is_file()
+    }
+    training_env = (dataset_manifest or {}).get("dataset_id")
+    if training_env is None and dataset_path is not None:
+        training_env = Path(dataset_path).parent.name
+    report = {
+        "variant": variant,
+        "env": env_id,
+        "config": config,
+        "provenance": {
+            "git_commit": git_commit_sha(),
+            "checkpoint_sha256": checkpoint_hashes,
+            "dataset": dataset_provenance(dataset_path, dataset_manifest)
+            if dataset_path is not None
+            else None,
+            "software": environment_metadata(device),
+            "seeds": {"episode_base": summary.get("seed")},
+        },
+        "environment_metadata": {
+            "evaluation_env": env_id,
+            "training_dataset_env": training_env,
+            "d4rl_closed_loop_parity": "BLOCKED",
+            "d4rl_closed_loop_parity_reason": (
+                "Cross-version environment difference: Gymnasium evaluation "
+                "(MuJoCo 3) vs D4RL *-v2 data (Gym 0.21 / MuJoCo 2.1). "
+                "Comparability has not been demonstrated; do not report official "
+                "D4RL normalized scores from this cross-version setup."
+            ),
+        },
+        "parity": parity,
+    }
+    report.update(summary)
+    return report

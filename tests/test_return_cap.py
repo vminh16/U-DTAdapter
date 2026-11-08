@@ -11,6 +11,8 @@ from udt.return_cap import (
     compute_expectile_foc_residual,
     compute_global_expectile,
     evaluate_return_capper,
+    load_return_capper,
+    save_return_capper,
     train_return_cap,
 )
 from udt.intervention import ReturnBudget
@@ -579,3 +581,55 @@ def test_reported_best_metrics_match_restored_checkpoint():
     assert global_metrics["best_val_loss"] == global_metrics["val_loss"][-1]
 
 
+
+
+def test_save_load_return_capper_roundtrip(tmp_path):
+    model = ReturnCapMLP(state_dim=3, hidden_dim=8, num_layers=2, mode="state_time")
+    capper = ReturnCapper(
+        model=model,
+        horizon=10,
+        margin=0.1,
+        scale=1000.0,
+        state_mean=np.zeros(3, dtype=np.float32),
+        state_std=np.ones(3, dtype=np.float32),
+    )
+    path = save_return_capper(
+        tmp_path / "return.pt",
+        capper,
+        metrics={"best_val_loss": 1.0},
+        seed=7,
+        tau=0.9,
+    )
+    loaded, payload = load_return_capper(path, expected_horizon=10, expected_scale=1000.0)
+    assert payload["seed"] == 7
+    state = np.array([0.5, -0.5, 0.0], dtype=np.float32)
+    assert np.isclose(loaded.get_cap(state, step=3), capper.get_cap(state, step=3))
+
+
+def test_load_legacy_return_capper_infers_architecture(tmp_path):
+    model = ReturnCapMLP(state_dim=3, hidden_dim=8, num_layers=2, mode="state_time")
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "mode": "state_time",
+        "horizon": 10,
+        "tau": 0.9,
+        "margin": 0.0,
+        "scale": 1000.0,
+        "state_mean": [0.0, 0.0, 0.0],
+        "state_std": [1.0, 1.0, 1.0],
+        "metrics": {},
+    }
+    path = tmp_path / "legacy.pt"
+    torch.save(payload, path)
+    loaded, _ = load_return_capper(path, expected_horizon=10, expected_scale=1000.0)
+    assert loaded.model.hidden_dim == 8
+    assert loaded.model.state_dim == 3
+    assert loaded.horizon == 10
+
+
+def test_load_legacy_global_json_capper(tmp_path):
+    path = tmp_path / "global.json"
+    path.write_text('{"cap_value": 1.25, "horizon": 10, "scale": 1000.0}')
+    loaded, _ = load_return_capper(path, expected_horizon=10, expected_scale=1000.0)
+    assert isinstance(loaded.model, GlobalReturnCap)
+    assert np.isclose(loaded.get_cap(np.zeros(3), step=0), 1.25)
