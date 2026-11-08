@@ -35,6 +35,9 @@ class RolloutResult:
     seed_mapping: dict[str, Any] = field(default_factory=dict)
     env_seeding: str = "unknown"
     warnings: list[str] = field(default_factory=list)
+    rtg_alpha: float = 1.0
+    effective_intervention_frequency: float = 0.0
+    mean_rtg_adjustment: float = 0.0
 
 
 
@@ -56,6 +59,7 @@ def evaluate_with_budget(
     policy_set_rng_fn: Callable[[np.random.Generator], None] | None = None,
     requires_proposal_rng: bool | None = None,
     strict_env_seed: bool = False,
+    rtg_alpha: float = 1.0,
 ) -> RolloutResult:
     """Execute a single closed-loop evaluation rollout with Return Budgeting.
 
@@ -99,6 +103,8 @@ def evaluate_with_budget(
         raise ValueError(f"obs_noise_scale must be non-negative, got {obs_noise_scale}")
     if act_noise_scale < 0 or not np.isfinite(act_noise_scale):
         raise ValueError(f"act_noise_scale must be non-negative, got {act_noise_scale}")
+    if not np.isfinite(rtg_alpha) or rtg_alpha < 0.0 or rtg_alpha > 1.0:
+        raise ValueError(f"rtg_alpha must be finite and in [0, 1], got {rtg_alpha}")
 
     if seed is not None and rng is not None:
         raise ValueError("Pass either seed or rng, not both")
@@ -230,6 +236,8 @@ def evaluate_with_budget(
     commanded_actions: list[np.ndarray] = []
     executed_actions: list[np.ndarray] = []
     clipped_flags: list[bool] = []
+    intervention_flags: list[bool] = []
+    rtg_adjustments: list[float] = []
     policy_infos: list[dict[str, Any]] = []
 
     if state_std is not None:
@@ -284,7 +292,7 @@ def evaluate_with_budget(
 
         if capper is not None:
             cap_val = capper.get_cap(policy_obs, step)
-            token = budget.token(cap=cap_val, margin=capper.margin)
+            token = budget.token(cap=cap_val, margin=capper.margin, alpha=rtg_alpha)
             was_clipped = raw_budget_at_t > (cap_val + capper.margin)
         else:
             cap_val = float("inf")
@@ -294,6 +302,9 @@ def evaluate_with_budget(
         caps.append(cap_val)
         tokens_used.append(token)
         clipped_flags.append(was_clipped)
+        adj = abs(token - raw_budget_at_t)
+        rtg_adjustments.append(float(adj))
+        intervention_flags.append(bool(adj > 1e-8))
 
         # Policy forward pass produces commanded action a*. Controllers may
         # additionally return a diagnostics dict for mechanism analysis.
@@ -388,6 +399,10 @@ def evaluate_with_budget(
             raise ValueError("Environment returned a non-finite observation")
 
     clipping_freq = float(np.mean(clipped_flags)) if clipped_flags else 0.0
+    effective_intervention_freq = (
+        float(np.mean(intervention_flags)) if intervention_flags else 0.0
+    )
+    mean_rtg_adj = float(np.mean(rtg_adjustments)) if rtg_adjustments else 0.0
 
     return RolloutResult(
         total_reward=total_reward,
@@ -408,5 +423,8 @@ def evaluate_with_budget(
         seed_mapping=seed_mapping,
         env_seeding=env_seeding,
         warnings=warnings_list,
+        rtg_alpha=float(rtg_alpha),
+        effective_intervention_frequency=effective_intervention_freq,
+        mean_rtg_adjustment=mean_rtg_adj,
     )
 

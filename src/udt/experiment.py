@@ -28,8 +28,12 @@ class VariantRun:
         infos = self.rollout.policy_infos
         return {
             "variant": self.variant,
+            "rtg_alpha": float(self.rollout.rtg_alpha),
             "raw_rtg": list(self.rollout.raw_budgets),
             "token_rtg": list(self.rollout.tokens_used),
+            "caps": list(self.rollout.caps),
+            "effective_intervention_frequency": float(self.rollout.effective_intervention_frequency),
+            "mean_rtg_adjustment": float(self.rollout.mean_rtg_adjustment),
             "original_actions": [np.asarray(i.get("original_action")).tolist()
                                  for i in infos if "original_action" in i],
             "selected_actions": [np.asarray(a).tolist() for a in self.rollout.actions],
@@ -64,6 +68,7 @@ def run_variant(
     action_low: np.ndarray | None = None,
     action_high: np.ndarray | None = None,
     strict_env_seed: bool = False,
+    rtg_alpha: float = 1.0,
 ) -> VariantRun:
     """Run one closed-loop variant.
 
@@ -74,6 +79,8 @@ def run_variant(
     """
     if variant not in SUPPORTED_VARIANTS:
         raise ValueError(f"Unknown variant {variant!r}; expected one of {SUPPORTED_VARIANTS}")
+    if not np.isfinite(rtg_alpha) or rtg_alpha < 0.0 or rtg_alpha > 1.0:
+        raise ValueError(f"rtg_alpha must be finite and in [0, 1], got {rtg_alpha}")
 
     # Validate scale and horizon invariants across active components:
     # c_dynamics == c_return == c_capper == c_rollout
@@ -168,6 +175,7 @@ def run_variant(
         policy_set_rng_fn=set_rng_fn,
         requires_proposal_rng=requires_proposal_rng,
         strict_env_seed=strict_env_seed,
+        rtg_alpha=rtg_alpha,
     )
     return VariantRun(variant=variant, rollout=rollout)
 
@@ -195,10 +203,13 @@ def evaluate_variant(
     action_high: np.ndarray | None = None,
     strict_env_seed: bool = False,
     collect_diagnostics: bool = False,
+    rtg_alpha: float = 1.0,
 ) -> dict[str, Any]:
     """Run the canonical multi-episode evaluation loop for one variant."""
     if not isinstance(episodes, (int, np.integer)) or episodes <= 0:
         raise ValueError(f"episodes must be a positive integer, got {episodes}")
+    if not np.isfinite(rtg_alpha) or rtg_alpha < 0.0 or rtg_alpha > 1.0:
+        raise ValueError(f"rtg_alpha must be finite and in [0, 1], got {rtg_alpha}")
 
     episode_records: list[dict[str, Any]] = []
     returns: list[float] = []
@@ -226,6 +237,7 @@ def evaluate_variant(
             action_low=action_low,
             action_high=action_high,
             strict_env_seed=strict_env_seed,
+            rtg_alpha=rtg_alpha,
         )
         rollout = run.rollout
         infos = rollout.policy_infos
@@ -246,6 +258,9 @@ def evaluate_variant(
             "truncated": bool(rollout.truncated),
             "final_raw_budget": float(rollout.final_raw_budget),
             "clipping_frequency": float(rollout.clipping_frequency),
+            "effective_intervention_frequency": float(rollout.effective_intervention_frequency),
+            "mean_rtg_adjustment": float(rollout.mean_rtg_adjustment),
+            "rtg_alpha": float(rollout.rtg_alpha),
             "intervention_frequency": (
                 float(np.mean([index != 0 for index in selected_indices]))
                 if selected_indices
@@ -273,6 +288,22 @@ def evaluate_variant(
         "target_return": float(initial_target),
         "reward_scale": float(reward_scale),
         "horizon": int(horizon),
+        "rtg_alpha": float(rtg_alpha),
+        "mean_clipping_frequency": (
+            float(np.mean([r["clipping_frequency"] for r in episode_records]))
+            if episode_records
+            else 0.0
+        ),
+        "mean_effective_intervention_frequency": (
+            float(np.mean([r["effective_intervention_frequency"] for r in episode_records]))
+            if episode_records
+            else 0.0
+        ),
+        "mean_rtg_adjustment": (
+            float(np.mean([r["mean_rtg_adjustment"] for r in episode_records]))
+            if episode_records
+            else 0.0
+        ),
         "mean_return": float(returns_array.mean()),
         "std_return": float(returns_array.std()),
         "median_return": float(np.median(returns_array)),

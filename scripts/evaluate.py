@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--allow-unsafe-legacy", action="store_true")
     parser.add_argument("--collect-diagnostics", action="store_true")
+    parser.add_argument("--rtg-alpha", type=float, default=1.0,
+                        help="RTG intervention strength in [0,1]. 0=no cap, 1=hard cap (default)")
     return parser.parse_args()
 
 
@@ -54,6 +56,8 @@ def main() -> int:
         raise ValueError(f"episodes must be positive, got {args.episodes}")
     if args.horizon <= 0:
         raise ValueError(f"horizon must be positive, got {args.horizon}")
+    if not np.isfinite(args.rtg_alpha) or args.rtg_alpha < 0 or args.rtg_alpha > 1:
+        raise ValueError(f"--rtg-alpha must be in [0, 1], got {args.rtg_alpha}")
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_file():
@@ -154,6 +158,7 @@ def main() -> int:
             action_low=adapter.action_low,
             action_high=adapter.action_high,
             collect_diagnostics=args.collect_diagnostics,
+            rtg_alpha=args.rtg_alpha,
         )
     finally:
         env.close()
@@ -172,6 +177,7 @@ def main() -> int:
             "num_candidates": args.num_candidates,
             "radius": args.radius,
             "beta": args.beta,
+            "rtg_alpha": args.rtg_alpha,
         },
         checkpoints={
             "decision_transformer": checkpoint,

@@ -359,7 +359,8 @@ class ReturnCapper:
             out = self.model(s_tensor, t_tensor)
             return out.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
-    def step(self, budget: ReturnBudget, state: np.ndarray | torch.Tensor, step: int) -> float:
+    def step(self, budget: ReturnBudget, state: np.ndarray | torch.Tensor, step: int,
+             alpha: float = 1.0) -> float:
         """Compute cap and return the clipped token for DT input.
 
         Leaves budget.raw unclipped for accurate reward subtraction!
@@ -368,6 +369,7 @@ class ReturnCapper:
             budget: Active ReturnBudget tracking raw return.
             state: Current environment observation.
             step: Current episode timestep.
+            alpha: Intervention strength in [0, 1]. 1.0 = hard cap, 0.0 = no cap.
 
         Returns:
             The clipped token B_t to be fed into Decision Transformer.
@@ -380,7 +382,7 @@ class ReturnCapper:
                 f"Scale mismatch: ReturnBudget scale ({budget.reward_scale}) != ReturnCapper scale ({self.scale})"
             )
         cap = self.get_cap(state, step)
-        return budget.token(cap=cap, margin=self.margin)
+        return budget.token(cap=cap, margin=self.margin, alpha=alpha)
 
 
 def evaluate_return_capper(

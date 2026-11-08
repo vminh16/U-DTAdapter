@@ -19,10 +19,16 @@ class ReturnBudget:
         if not np.isfinite(self.raw) or not np.isfinite(self.reward_scale) or self.reward_scale <= 0:
             raise ValueError('Budget must be finite and reward_scale positive')
 
-    def token(self, cap: float | None = None, margin: float = 0.) -> float:
+    def token(self, cap: float | None = None, margin: float = 0.,
+              alpha: float = 1.0) -> float:
         if not np.isfinite(margin) or margin < 0 or (cap is not None and not np.isfinite(cap)):
             raise ValueError('Cap must be finite and margin nonnegative')
-        return self.raw if cap is None else min(self.raw, cap + margin)
+        if not np.isfinite(alpha) or alpha < 0 or alpha > 1:
+            raise ValueError('alpha must be finite and in [0, 1]')
+        if cap is None:
+            return self.raw
+        ceiling = cap + margin
+        return self.raw - alpha * max(0.0, self.raw - ceiling)
 
     def observe_reward(self, reward: float) -> None:
         if not np.isfinite(reward):
